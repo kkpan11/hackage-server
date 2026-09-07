@@ -9,7 +9,6 @@ import qualified Control.Monad.Trans.State as State
 import qualified Data.Array as Arr
 import qualified Data.Bimap as Bimap
 import qualified Data.ByteString.Lazy as Lazy (ByteString)
-import qualified Data.ByteString.Lazy as ByteStringL
 import           Data.Foldable (for_)
 import           Data.Functor.Identity (Identity(..))
 import           Data.List (partition, foldl')
@@ -24,24 +23,16 @@ import           Network.URI (parseURI)
 import           System.Random (mkStdGen)
 
 import Distribution.Package (PackageIdentifier(..), mkPackageName, packageId, packageName)
-import Distribution.Server.Features.PreferredVersions.State (PreferredVersions(..), VersionStatus(NormalVersion), PreferredInfo(..))
+import Distribution.Server.Features.PreferredVersions.State (PreferredVersions(..), PreferredInfo(..))
+import Distribution.Server.Features.PreferredVersions.Types (VersionStatus(NormalVersion))
 import Distribution.Server.Features.ReverseDependencies (ReverseFeature(..), ReverseCount(..), reverseFeature)
 import Distribution.Server.Features.ReverseDependencies.State (ReverseIndex(..), addPackage, constructReverseIndex, emptyReverseIndex, getDependenciesFlat, getDependencies, getDependenciesFlatRaw, getDependenciesRaw)
 import Distribution.Server.Features.Tags (Tag(..))
-import Distribution.Server.Features.UserDetails (AccountDetails(..), UserDetailsFeature(..))
+import Distribution.Server.Features.UserDetails (UserDetailsFeature(..))
+import Distribution.Server.Features.UserDetails.Types (AccountDetails(..))
 import Distribution.Server.Features.UserNotify
-  ( Notification(..)
-  , NotifyMaintainerUpdateType(..)
-  , NotifyData(..)
-  , NotifyPref(..)
-  , NotifyRevisionRange(..)
-  , NotifyTriggerBounds(..)
-  , defaultNotifyPrefs
-  , getNotificationEmails
-  , getUserNotificationsOnRelease
-  , importNotifyPref
-  , notifyDataToCSV
-  )
+import Distribution.Server.Features.UserNotify.Acid
+import Distribution.Server.Features.UserNotify.Types
 import Distribution.Server.Framework.BackupRestore (runRestore)
 import Distribution.Server.Framework.Hook (newHook)
 import Distribution.Server.Framework.MemState (newMemStateWHNF)
@@ -551,7 +542,7 @@ getNotificationEmailsTests =
     genPackageName = mkPackageName <$> Gen.string (Range.linear 1 30) Gen.unicode
     genVersion = mkVersion <$> Gen.list (Range.linear 1 4) (Gen.int $ Range.linear 0 50)
     genPackageId = PackageIdentifier <$> genPackageName <*> genVersion
-    genCabalFileText = CabalFileText . ByteStringL.fromStrict <$> Gen.utf8 (Range.linear 0 50000) Gen.unicode
+    genCabalFileText = CabalFileText <$> Gen.utf8 (Range.linear 0 50000) Gen.unicode
     genNonExistentUserId = UserId <$> Gen.int (Range.linear (-1000) (-1))
     genUploadInfo = (,) <$> genUTCTime <*> genNonExistentUserId
     genTag = Tag <$> Gen.string (Range.linear 1 10) Gen.unicode

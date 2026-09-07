@@ -40,7 +40,6 @@ import qualified Data.Map as Map
 import           Data.Maybe (mapMaybe, maybeToList)
 import qualified Data.Set as Set
 import           Data.Set (Set, fromList, toList, delete)
-import           Data.Typeable (Typeable)
 import           Data.Graph (Graph, Vertex)
 import qualified Data.Graph as Gr
 
@@ -48,7 +47,9 @@ import           Distribution.Package
 import           Distribution.PackageDescription
 import           Distribution.Server.Packages.Types
 import           Distribution.Server.Framework.MemSize
+import           Distribution.Server.Features.PreferredVersions (maybeBestVersion)
 import           Distribution.Server.Features.PreferredVersions.State
+import           Distribution.Server.Features.PreferredVersions.Types
 import           Distribution.Server.Packages.PackageIndex (PackageIndex)
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import           Distribution.Version
@@ -66,7 +67,7 @@ data ReverseIndex = ReverseIndex
   { reverseDependencies :: !RevDeps
   , packageNodeIdMap    :: !(Bimap PackageName NodeId)
   , deps :: Map PackageIdentifier [Dependency]
-  } deriving (Eq, Show, Typeable)
+  } deriving (Eq, Show)
 
 instance MemSize Dependency where
     memSize = fromIntegral . BS.length . encode
@@ -150,7 +151,7 @@ harvestDependencies (CondNode _ dependencies comps) = dependencies ++ concatMap 
 data ReverseCount = ReverseCount
   { directCount :: Int
   , totalCount :: Int
-  } deriving (Show, Eq, Typeable, Ord)
+  } deriving (Show, Eq, Ord)
 
 instance MemSize ReverseCount where
     memSize (ReverseCount a b) = memSize2 a b

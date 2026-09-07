@@ -27,7 +27,7 @@ import qualified Codec.Compression.GZip                             as GZip
 import           Data.Aeson                                         (Value (..), toJSON)
 import qualified Data.Aeson.Key                                     as Key
 import qualified Data.Aeson.KeyMap                                  as KeyMap
-import           Data.ByteString.Lazy                               (ByteString)
+import           Data.ByteString.Lazy                               (LazyByteString, fromStrict)
 import qualified Data.Foldable                                      as Foldable
 import qualified Data.Text                                          as Text
 import           Data.Time.Clock                                    (UTCTime, getCurrentTime)
@@ -38,7 +38,7 @@ import qualified Data.Vector                                        as Vec
 import           Distribution.Server.Prelude
 
 import           Distribution.Server.Features.Core.Backup
-import           Distribution.Server.Features.Core.State
+import qualified Distribution.Server.Features.Core.State            as Acid
 import           Distribution.Server.Features.Security.Migration
 import           Distribution.Server.Features.Security.SHA256       (sha256)
 import           Distribution.Server.Features.Users
@@ -116,7 +116,7 @@ data CoreFeature = CoreFeature {
     -- If this package was found, runs a `PackageChangeInfo` hook when done and
     -- returns True.
     updateSetPackageUploader :: forall m. MonadIO m => PackageId -> UserId -> m Bool,
-    -- | Sets the upload time of an existing package version.
+    -- | Acid.Sets the upload time of an existing package version.
     --
     -- If this package was found, runs a `PackageChangeInfo` hook when done and
     -- returns True.
@@ -130,7 +130,7 @@ data CoreFeature = CoreFeature {
     -- modification time for the tar entry.
     --
     -- This runs a `PackageChangeIndexExtra` hook when done.
-    updateArchiveIndexEntry :: forall m. MonadIO m => FilePath -> ByteString -> UTCTime -> m (),
+    updateArchiveIndexEntry :: forall m. MonadIO m => FilePath -> LazyByteString -> UTCTime -> m (),
 
     -- | Notification of package or index changes.
     packageChangeHook :: Hook PackageChange (),
@@ -175,7 +175,7 @@ data PackageChange
     | PackageChangeInfo PackageUpdate PkgInfo PkgInfo
     -- | A file has changed in the package index tar not covered by any of the
     -- other change types.
-    | PackageChangeIndexExtra String ByteString UTCTime
+    | PackageChangeIndexExtra String LazyByteString UTCTime
 
 -- | A predicate to use with `packageChangeHook` and `registerHookJust` for
 -- keeping other features synchronized with the main package index.
@@ -212,7 +212,7 @@ isPackageDeleteVersion             :: Maybe PackageId,
 isPackageChangeCabalFile           :: Maybe (PackageId, CabalFileText),
 isPackageChangeCabalFileUploadInfo :: Maybe (PackageId, UploadInfo),
 isPackageChangeTarball             :: Maybe (PackageId, PkgTarball),
-isPackageIndexExtraChange          :: Maybe (String, ByteString, UTCTime)
+isPackageIndexExtraChange          :: Maybe (String, LazyByteString, UTCTime)
 -}
 
 data CoreResource = CoreResource {
@@ -226,7 +226,6 @@ data CoreResource = CoreResource {
     corePackageTarball  :: Resource,
     -- | A Cabal file metatada revision.
     coreCabalFileRev    :: Resource,
-    coreCabalFileRevName    :: Resource,
 
     -- Rendering resources.
     -- | URI for `corePackagesPage`, given a format (blank for none).
@@ -290,7 +289,7 @@ initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
       --   rather than BlobId; that is, we additionally record the length and
       --   SHA256 hash for all blobs.
       --
-      -- Additionally, we now need `package.json` files for all versions of all
+      -- Acid.Additionally, we now need `package.json` files for all versions of all
       -- packages. For new packages we add these when the package is uploaded,
       -- but for previously uploaded packages we need to add them.
       --
@@ -300,13 +299,13 @@ initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
       -- we can use the check for the existence of the update log to see if we
       -- need any other kind of migration.
 
-      migrateUpdateLog <- (isLeft . packageUpdateLog) <$>
-                             queryState packagesState GetPackagesState
+      migrateUpdateLog <- (isLeft . Acid.packageUpdateLog) <$>
+                             queryState packagesState Acid.GetPackagesState
       when migrateUpdateLog $ do
-        -- Migrate PackagesState (introduce package update log)
+        -- Migrate Acid.PackagesState (introduce package update log)
         logTiming verbosity "migrating package update log" $ do
           userdb <- queryGetUserDb users
-          updateState packagesState (MigrateAddUpdateLog userdb)
+          updateState packagesState (Acid.MigrateAddUpdateLog userdb)
 
         -- Migrate PkgTarball
         logTiming verbosity "migrating PkgTarball" $
@@ -355,21 +354,21 @@ initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
              PackageChangeAdd _ -> return ()
              _ -> do
                      additionalEntries <- concat <$> runHook preIndexUpdateHook packageChange
-                     forM_ additionalEntries $ updateState packagesState . AddOtherIndexEntry
+                     forM_ additionalEntries $ updateState packagesState . Acid.AddOtherIndexEntry
         prodAsyncCache indexTar "package change"
 
       return feature
 
-packagesStateComponent :: Verbosity -> Bool -> FilePath -> IO (StateComponent AcidState PackagesState)
+packagesStateComponent :: Verbosity -> Bool -> FilePath -> IO (StateComponent AcidState Acid.PackagesState)
 packagesStateComponent verbosity freshDB stateDir = do
   let stateFile = stateDir </> "db" </> "PackagesState"
   st <- logTiming verbosity "Loaded PackagesState" $
-          openLocalStateFrom stateFile (initialPackagesState freshDB)
+          openLocalStateFrom stateFile (Acid.initialPackagesState freshDB)
   return StateComponent {
        stateDesc    = "Main package database"
      , stateHandle  = st
-     , getState     = query st GetPackagesState
-     , putState     = update st . ReplacePackagesState
+     , getState     = query st Acid.GetPackagesState
+     , putState     = update st . Acid.ReplacePackagesState
      , backupState  = \_ -> indexToAllVersions
      , restoreState = packagesBackup
      , resetState   = packagesStateComponent verbosity True
@@ -377,7 +376,7 @@ packagesStateComponent verbosity freshDB stateDir = do
 
 coreFeature :: ServerEnv
             -> UserFeature
-            -> StateComponent AcidState PackagesState
+            -> StateComponent AcidState Acid.PackagesState
             -> AsyncCache IndexTarballInfo
             -> Hook PackageChange ()
             -> Hook PackageChange [TarIndexEntry]
@@ -405,7 +404,6 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           , coreCabalFile
           , coreCabalFileRevs
           , coreCabalFileRev
-          , coreCabalFileRevName
           , coreUserDeauth
           , coreAdminDeauth
           , corePackUserDeauth
@@ -459,11 +457,6 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
         resourceDesc = [(GET, "Get package .cabal file revision")]
       , resourceGet  = [("cabal", serveCabalFileRevision)]
       }
-    coreCabalFileRevName = (resourceAt "/package/:package/revision/:tarball-:revision.:format") {
-        resourceDesc = [(GET, "Get package .cabal file revision with name")]
-      , resourceGet  = [("cabal", serveCabalFileRevisionName)]
-      }
-
 
     coreUserDeauth = (resourceAt "/packages/deauth") {
         resourceDesc = [(GET,  "Deauth Package user")]
@@ -512,7 +505,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     -- Queries
     --
     queryGetPackageIndex :: MonadIO m => m (PackageIndex PkgInfo)
-    queryGetPackageIndex = packageIndex <$> queryState packagesState GetPackagesState
+    queryGetPackageIndex = Acid.packageIndex <$> queryState packagesState Acid.GetPackagesState
 
     queryGetIndexTarballInfo :: MonadIO m => m IndexTarballInfo
     queryGetIndexTarballInfo = readAsyncCache cacheIndexTarball
@@ -530,11 +523,11 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
       usersdb <- queryGetUserDb
       let Just userInfo = lookupUserId uid usersdb
 
-      let pkginfo = mkPackageInfo pkgid cabalFile uploadinfo mtarball
+      let pkginfo = Acid.mkPackageInfo pkgid cabalFile uploadinfo mtarball
       additionalEntries <- concat `liftM` runHook preIndexUpdateHook  (PackageChangeAdd pkginfo)
 
       successFlag <- updateState packagesState $
-        AddPackage3
+        Acid.AddPackage3
           pkginfo
           uploadinfo
           (userName userInfo)
@@ -548,7 +541,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateDeletePackage :: MonadIO m => PackageId -> m Bool
     updateDeletePackage pkgid = logTiming maxBound ("updateDeletePackage " ++ display pkgid) $ do
-      mpkginfo <- updateState packagesState (DeletePackage pkgid)
+      mpkginfo <- updateState packagesState (Acid.DeletePackage pkgid)
       case mpkginfo of
         Nothing -> return False
         Just pkginfo -> do
@@ -560,7 +553,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
       usersdb <- queryGetUserDb
       let Just userInfo = lookupUserId uid usersdb
       (moldpkginfo, newpkginfo) <- updateState packagesState $
-        AddPackageRevision2
+        Acid.AddPackageRevision2
           pkgid
           cabalfile
           uploadinfo
@@ -574,7 +567,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateAddPackageTarball :: MonadIO m => PackageId -> PkgTarball -> UploadInfo -> m Bool
     updateAddPackageTarball pkgid tarball uploadinfo = logTiming maxBound ("updateAddPackageTarball " ++ display pkgid) $ do
-      mpkginfo <- updateState packagesState (AddPackageTarball pkgid tarball uploadinfo)
+      mpkginfo <- updateState packagesState (Acid.AddPackageTarball pkgid tarball uploadinfo)
 
       case mpkginfo of
         Nothing -> return False
@@ -583,7 +576,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           return True
 
     updateSetPackageUploader pkgid userid = do
-      mpkginfo <- updateState packagesState (SetPackageUploader pkgid userid)
+      mpkginfo <- updateState packagesState (Acid.SetPackageUploader pkgid userid)
       case mpkginfo of
         Nothing -> return False
         Just (oldpkginfo, newpkginfo) -> do
@@ -591,17 +584,17 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           return True
 
     updateSetPackageUploadTime pkgid time = do
-      mpkginfo <- updateState packagesState (SetPackageUploadTime pkgid time)
+      mpkginfo <- updateState packagesState (Acid.SetPackageUploadTime pkgid time)
       case mpkginfo of
         Nothing -> return False
         Just (oldpkginfo, newpkginfo) -> do
           runHook_ packageChangeHook  (PackageChangeInfo PackageUpdatedUploadTime oldpkginfo newpkginfo)
           return True
 
-    updateArchiveIndexEntry :: MonadIO m => FilePath -> ByteString -> UTCTime -> m ()
+    updateArchiveIndexEntry :: MonadIO m => FilePath -> LazyByteString -> UTCTime -> m ()
     updateArchiveIndexEntry entryName entryData entryTime = logTiming maxBound ("updateArchiveIndexEntry " ++ show entryName) $ do
       updateState packagesState $
-        AddOtherIndexEntry $ ExtraEntry entryName entryData entryTime
+        Acid.AddOtherIndexEntry $ ExtraEntry entryName entryData entryTime
       runHook_ packageChangeHook (PackageChangeIndexExtra entryName entryData entryTime)
 
     -- Cache updates
@@ -610,7 +603,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     getIndexTarball = do
       users <- queryGetUserDb  -- note, changes here don't automatically propagate
       time  <- getCurrentTime
-      PackagesState index (Right updateSeq) <- queryState packagesState GetPackagesState
+      Acid.PackagesState index (Right updateSeq) <- queryState packagesState Acid.GetPackagesState
       let updateLog     = Foldable.toList updateSeq
           legacyTarball = Packages.Index.writeLegacy
                             users
@@ -667,7 +660,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     serveLegacyPackagesIndexTarGz _ = do
       tarball <- indexTarballLegacyGz <$> readAsyncCache cacheIndexTarball
       let tarballmd5 = show $ tarGzHashMD5 tarball
-      cacheControl [Public, NoTransform, maxAgeMinutes 5] (ETag tarballmd5)
+      cacheControl [Public, NoTransform, maxAgeMinutes 1] (ETag tarballmd5)
       enableRange
       return $ toResponse tarball
 
@@ -675,7 +668,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     serveIncremPackagesIndexTarGz _ = do
       tarball <- indexTarballIncremGz <$> readAsyncCache cacheIndexTarball
       let tarballmd5 = show $ tarGzHashMD5 tarball
-      cacheControl [Public, NoTransform, maxAgeMinutes 5] (ETag tarballmd5)
+      cacheControl [Public, NoTransform, maxAgeMinutes 1] (ETag tarballmd5)
       enableRange
       return $ toResponse tarball
 
@@ -683,7 +676,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     serveIncremPackagesIndexTar _ = do
       tarball <- indexTarballIncremUn <$> readAsyncCache cacheIndexTarball
       let tarballmd5 = show $ tarHashMD5 tarball
-      cacheControl [Public, NoTransform, maxAgeMinutes 5] (ETag tarballmd5)
+      cacheControl [Public, NoTransform, maxAgeMinutes 1] (ETag tarballmd5)
       enableRange
       return $ toResponse tarball
 
@@ -728,17 +721,16 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
       -- check that the cabal name matches the package
       guard (lookup "cabal" dpath == Just (display $ packageName pkginfo))
       let (fileRev, (utime, _uid)) = pkgLatestRevision pkginfo
-          cabalfile = Resource.CabalFile (cabalFileByteString fileRev) utime
+          cabalfile = Resource.CabalFile (fromStrict $ cabalFileByteString fileRev) utime
       return $ toResponse cabalfile
 
     serveCabalFileRevisionsList :: DynamicPath -> ServerPartE Response
     serveCabalFileRevisionsList dpath = do
-      pkginfo <- packageInPath dpath >>= lookupPackageId
+      revisions <- fmap pkgMetadataRevisions $ packageInPath dpath >>= lookupPackageId
       users   <- queryGetUserDb
-      let revisions = pkgMetadataRevisions pkginfo
-          revisionToObj rev (cabalFileText, (utime, uid)) =
+      let revisionToObj rev (cabalFileText, (utime, uid)) =
             let uname = userIdToName users uid
-                hash = sha256 (cabalFileByteString cabalFileText)
+                hash = sha256 (fromStrict $ cabalFileByteString cabalFileText)
             in
             Object $ KeyMap.fromList
               [ (Key.fromString "number", Number (fromIntegral rev))
@@ -753,26 +745,10 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     serveCabalFileRevision dpath = do
       pkginfo <- packageInPath dpath >>= lookupPackageId
       let mrev      = lookup "revision" dpath >>= fromReqURI
-          revisions = pkgMetadataRevisions pkginfo
-      case mrev >>= \rev -> revisions Vec.!? rev of
+      case mrev >>= pkgSpecificRevision pkginfo of
         Just (fileRev, (utime, _uid)) -> return $ toResponse cabalfile
           where
-            cabalfile = Resource.CabalFile (cabalFileByteString fileRev) utime
-        Nothing -> errNotFound "Package revision not found"
-                     [MText "Cannot parse revision, or revision out of range."]
-
-    serveCabalFileRevisionName :: DynamicPath -> ServerPartE Response
-    serveCabalFileRevisionName dpath = do
-      pkgid1 <- packageTarballInPath dpath
-      pkgid2 <- packageInPath dpath
-      guard (pkgVersion pkgid2 == pkgVersion pkgid2)
-      pkginfo <- packageInPath dpath >>= lookupPackageId
-      let mrev      = lookup "revision" dpath >>= fromReqURI
-          revisions = pkgMetadataRevisions pkginfo
-      case mrev >>= \rev -> revisions Vec.!? rev of
-        Just (fileRev, (utime, _uid)) -> return $ toResponse cabalfile
-          where
-            cabalfile = Resource.CabalFile (cabalFileByteString fileRev) utime
+            cabalfile = Resource.CabalFile (fromStrict $ cabalFileByteString fileRev) utime
         Nothing -> errNotFound "Package revision not found"
                      [MText "Cannot parse revision, or revision out of range."]
 

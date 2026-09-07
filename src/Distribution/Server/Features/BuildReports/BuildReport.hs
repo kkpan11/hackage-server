@@ -106,8 +106,6 @@ import qualified Data.ByteString.Char8 as BS
 import qualified Data.Map as Map
 import Data.Time
          ( UTCTime, getCurrentTime )
-import Data.Typeable
-         ( Typeable )
 import Control.Applicative
 import Control.Monad
 
@@ -166,7 +164,7 @@ data BuildReport
     -- | Configure outcome, did configure work ok?
     testsOutcome    :: Outcome
   }
-  deriving (Eq, Typeable, Show)
+  deriving (Eq,  Show)
 
 packageL :: Lens' BuildReport PackageIdentifier
 packageL f s = fmap (\x -> s { package = x }) (f (package s))
@@ -266,7 +264,7 @@ data BooleanCovg = BooleanCovg {
   guards        :: (Int,Int),
   ifConditions  :: (Int,Int),
   qualifiers    :: (Int,Int)
-} deriving (Eq, Typeable, Show)
+} deriving (Eq, Show)
 
 data BuildCovg = BuildCovg {
   expressions       :: (Int,Int),
@@ -274,7 +272,17 @@ data BuildCovg = BuildCovg {
   alternatives      :: (Int,Int),
   localDeclarations :: (Int,Int),
   topLevel          :: (Int,Int)
-} deriving (Eq, Typeable, Show)
+} deriving (Eq, Show)
+
+instance Arbitrary BuildCovg where
+  arbitrary =
+    BuildCovg
+      <$> intPair
+      <*> liftA3 BooleanCovg intPair intPair intPair
+      <*> intPair
+      <*> intPair
+      <*> intPair
+    where intPair = liftA2 (,) arbitrary arbitrary
 
 instance MemSize BuildCovg where
     memSize (BuildCovg a (BooleanCovg b c d) e f g) = memSize7 a b c d e f g
@@ -366,12 +374,19 @@ newtype FlagAss1 = FlagAss1 (FlagName,Bool)
 instance Newtype (FlagName,Bool) FlagAss1
 
 instance Parsec FlagAss1 where
-  parsec = do
-    -- this is subtly different from Cabal's 'FlagName' parser
-    name <- P.munch1 (\c -> Char.isAlphaNum c || c == '_' || c == '-')
-    case name of
-      ('-':flag) -> return $ FlagAss1 (mkFlagName flag, False)
-      flag       -> return $ FlagAss1 (mkFlagName flag, True)
+  parsec = fmap FlagAss1 (posPolarity <|> negPolarity <|> noPolarity)
+    where
+      posPolarity = do
+          P.char '+'
+          (,) <$> flagName <*> pure True
+      negPolarity = do
+          P.char '-'
+          (,) <$> flagName <*> pure False
+      noPolarity =
+          (,) <$> flagName <*> pure True
+
+      -- this is subtly different from Cabal's 'FlagName' parser
+      flagName = mkFlagName <$> P.munch1 (\c -> Char.isAlphaNum c || c == '_' || c == '-')
 
 instance Pretty FlagAss1 where
   pretty (FlagAss1 (fn, True))  = Disp.text (unFlagName fn)
@@ -492,7 +507,11 @@ instance Arbitrary Outcome where
   arbitrary = elements [ NotTried, Failed, Ok ]
 
 data BuildStatus = BuildOK | BuildFailCnt Int
-  deriving (Eq, Ord, Typeable, Show)
+  deriving (Eq, Ord, Show)
+
+instance Arbitrary BuildStatus where
+  arbitrary = oneof [ pure BuildOK, BuildFailCnt <$> arbitrary ]
+
 instance ToJSON BuildStatus where
   toJSON (BuildFailCnt a) = toJSON a
   toJSON BuildOK          = toJSON ((-1)::Int)
@@ -613,6 +632,7 @@ data BuildFiles = BuildFiles {
   logContent :: Maybe String,
   testContent :: Maybe String,
   coverageContent :: Maybe String,
+  testReportContent :: Maybe String,
   buildFail :: Bool
 } deriving Show
 
@@ -623,6 +643,7 @@ instance Data.Aeson.FromJSON BuildFiles where
       <*> o .:? "log"
       <*> o .:? "test"
       <*> o .:? "coverage"
+      <*> o .:? "testReport"
       <*> o .: "buildFail"
 
 instance Data.Aeson.ToJSON BuildFiles where
@@ -631,6 +652,7 @@ instance Data.Aeson.ToJSON BuildFiles where
     "log"       .= logContent  p,
     "test"      .= testContent p,
     "coverage"  .= coverageContent  p,
+    "testReport".= testReportContent p,
     "buildFail" .= buildFail  p ]
 
 data PkgDetails = PkgDetails {

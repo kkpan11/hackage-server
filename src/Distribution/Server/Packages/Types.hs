@@ -1,6 +1,8 @@
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving, DeriveDataTypeable,
              StandaloneDeriving, TemplateHaskell, TypeFamilies,
              RecordWildCards #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Server.Packages.Types
@@ -17,11 +19,12 @@ module Distribution.Server.Packages.Types where
 
 import Distribution.Server.Prelude
 
+import Distribution.Server.Framework (FromReqURI(..))
 import Distribution.Server.Users.Types (UserId(..))
 import Distribution.Server.Framework.BlobStorage (BlobId, BlobId_v0, BlobStorage)
 import Distribution.Server.Framework.Instances (PackageIdentifier_v0)
 import Distribution.Server.Framework.MemSize
-import Distribution.Server.Util.Parse (unpackUTF8)
+import Distribution.Server.Util.Parse (unpackUTF8Strict)
 import Distribution.Server.Features.Security.Orphans ()
 import Distribution.Server.Features.Security.MD5
 import Distribution.Server.Features.Security.SHA256
@@ -34,8 +37,10 @@ import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec
          ( parseGenericPackageDescription, runParseResult )
 
+import Data.Aeson (ToJSON)
 import Data.Serialize (Serialize)
-import Data.ByteString.Lazy (ByteString)
+import Data.ByteString (StrictByteString)
+import Data.ByteString.Lazy (LazyByteString)
 import Data.Time.Clock (UTCTime(..))
 import Data.Time.Calendar (Day(..))
 import Data.SafeCopy
@@ -47,7 +52,9 @@ import qualified Data.Vector          as Vec
   Datatypes
 -------------------------------------------------------------------------------}
 
-newtype CabalFileText = CabalFileText { cabalFileByteString :: ByteString }
+-- | Cabal files are definitely small enough to use a strict ByteString.
+-- This eliminates one possible source of issues with lazy IO.
+newtype CabalFileText = CabalFileText { cabalFileByteString :: StrictByteString }
   deriving (Eq, MemSize)
 
 -- | The information we keep about a particular version of a package.
@@ -70,7 +77,7 @@ data PkgInfo = PkgInfo {
     --
     pkgTarballRevisions :: !(Vec.Vector (PkgTarball, UploadInfo))
 
-} deriving (Eq, Typeable, Show)
+} deriving (Eq, Show)
 
 data PkgInfo_v2 = PkgInfo_v2 {
     v2_pkgInfoId            :: !PackageIdentifier,
@@ -95,7 +102,7 @@ data BlobInfo = BlobInfo {
     blobInfoId         :: !BlobId,
     blobInfoLength     :: !Int,
     blobInfoHashSHA256 :: !SHA256Digest
-} deriving (Eq, Typeable, Show)
+} deriving (Eq, Show)
 
 blobInfoHashMD5 :: BlobInfo -> MD5Digest
 blobInfoHashMD5 = BlobStorage.blobMd5Digest . blobInfoId
@@ -109,12 +116,12 @@ data PkgTarball =
   -- translation from PkgTarball_v1 to this PkgTarball requires access to the blob
   -- store and is therefore not pure.)
   | PkgTarball_v2_v1 PkgTarball_v1
-  deriving (Eq, Typeable, Show)
+  deriving (Eq, Show)
 
 data PkgTarball_v1 = PkgTarball_v1 {
    v1_pkgTarballGz   :: !BlobId,
    v1_pkgTarballNoGz :: !BlobId
-} deriving (Eq, Typeable, Show)
+} deriving (Eq, Show)
 
 data PkgTarball_v0 = PkgTarball_v0 !BlobId_v0 !BlobId_v0
 
@@ -155,8 +162,24 @@ instance Package PkgInfo where
   Utility
 -------------------------------------------------------------------------------}
 
+newtype MetadataRevIx = MetadataRevIx { getMetadataRevIx :: Int }
+  deriving newtype (Eq, Ord, Show, MemSize, Read, FromReqURI, ToJSON, Serialize)
+
+instance SafeCopy MetadataRevIx where
+    getCopy = contain Serialize.get
+    putCopy = contain . Serialize.put
+    errorTypeName _ = "MetadataRevIx"
+
+newtype TarballRevIx = TarballRevIx { getTarballRevIx :: Int }
+  deriving newtype (Eq, Ord, Show, MemSize, Read, FromReqURI, ToJSON, Serialize)
+
+instance SafeCopy TarballRevIx where
+    getCopy = contain Serialize.get
+    putCopy = contain . Serialize.put
+    errorTypeName _ = "TarballRevIx"
+
 cabalFileString :: CabalFileText -> String
-cabalFileString = unpackUTF8 . cabalFileByteString
+cabalFileString = unpackUTF8Strict . cabalFileByteString
 
 pkgOriginalRevision :: PkgInfo -> (CabalFileText, UploadInfo)
 pkgOriginalRevision = Vec.head . pkgMetadataRevisions
@@ -173,6 +196,21 @@ pkgOriginalUploadUser = snd . pkgOriginalUploadInfo
 pkgLatestRevision :: PkgInfo -> (CabalFileText, UploadInfo)
 pkgLatestRevision = Vec.last . pkgMetadataRevisions
 
+pkgSpecificRevision :: PkgInfo -> MetadataRevIx -> Maybe (CabalFileText, UploadInfo)
+pkgSpecificRevision pkg (MetadataRevIx revno) = pkgMetadataRevisions pkg Vec.!? revno
+
+pkgAllRevisionsCabalFiles :: PkgInfo -> [CabalFileText]
+pkgAllRevisionsCabalFiles = fmap fst . Vec.toList . pkgMetadataRevisions
+
+pkgSpecificTarball :: PkgInfo -> TarballRevIx -> Maybe (PkgTarball, UploadInfo)
+pkgSpecificTarball pkg (TarballRevIx revno) = pkgTarballRevisions pkg Vec.!? revno
+
+pkgAllTarballs :: PkgInfo -> [(PkgTarball, UploadInfo)]
+pkgAllTarballs = Vec.toList . pkgTarballRevisions
+
+pkgAllRevisionsUploadInfos :: PkgInfo -> [UploadInfo]
+pkgAllRevisionsUploadInfos = fmap snd . Vec.toList . pkgMetadataRevisions
+
 pkgLatestCabalFileText :: PkgInfo -> CabalFileText
 pkgLatestCabalFileText = fst . pkgLatestRevision
 
@@ -187,6 +225,9 @@ pkgLatestUploadUser = snd . pkgLatestUploadInfo
 
 pkgNumRevisions :: PkgInfo -> Int
 pkgNumRevisions = Vec.length . pkgMetadataRevisions
+
+pkgMaxRevision :: PkgInfo -> MetadataRevIx
+pkgMaxRevision = MetadataRevIx . subtract 1 . pkgNumRevisions
 
 -- | The latest tarball for a package (if any)
 --
@@ -208,7 +249,7 @@ pkgLatestTarball pkginfo =
 pkgDesc :: PkgInfo -> GenericPackageDescription
 pkgDesc pkgInfo =
     case runParseResult $ parseGenericPackageDescription $
-         BS.L.toStrict $ cabalFileByteString $ fst $
+         cabalFileByteString $ fst $
          pkgLatestRevision pkgInfo of
       -- We only make PkgInfos with parsable pkgDatas, so if it
       -- doesn't parse then something has gone wrong.
@@ -219,7 +260,7 @@ pkgDesc pkgInfo =
 pkgDescMaybe :: PkgInfo -> Maybe GenericPackageDescription
 pkgDescMaybe pkgInfo =
     case runParseResult $ parseGenericPackageDescription $
-         BS.L.toStrict $ cabalFileByteString $ fst $
+         cabalFileByteString $ fst $
          pkgLatestRevision pkgInfo of
       -- We only make PkgInfos with parsable pkgDatas, so if it
       -- doesn't parse then something has gone wrong.
@@ -227,7 +268,7 @@ pkgDescMaybe pkgInfo =
       (_, Right x)     -> Just x
 
 
-blobInfoFromBS :: BlobId -> ByteString -> BlobInfo
+blobInfoFromBS :: BlobId -> LazyByteString -> BlobInfo
 blobInfoFromBS blobId bs = BlobInfo {
       blobInfoId         = blobId
     , blobInfoLength     = fromIntegral $ BS.L.length bs
@@ -339,3 +380,4 @@ instance Migrate PkgInfo where
       }
 
 deriveSafeCopy 4 'extension ''PkgInfo
+

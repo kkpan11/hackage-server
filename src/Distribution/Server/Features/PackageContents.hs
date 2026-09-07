@@ -18,16 +18,13 @@ import Distribution.Server.Packages.Render
 import Distribution.Server.Features.Users
 import Distribution.Server.Util.ServeTarball
 import Distribution.Server.Util.Markdown (renderMarkdown, supposedToBeMarkdown)
+import Distribution.Server.Util.Parse (unpackUTF8)
 import Distribution.Server.Pages.Template (hackagePage)
 
 import Distribution.Text
 import Distribution.Package
 import Distribution.PackageDescription
 
-import qualified Data.Text                as T
-import qualified Data.Text.Encoding       as T
-import qualified Data.Text.Encoding.Error as T
-import qualified Data.ByteString.Lazy as BS (ByteString, toStrict)
 import qualified Text.XHtml.Strict as XHtml
 import qualified Distribution.Utils.ShortText as ST
 import           Text.XHtml.Strict ((<<), (!))
@@ -74,7 +71,7 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
                                     }
                                   }
                        TarIndexCacheFeature{packageTarball, findToplevelFile}
-                       UserFeature{queryGetUserDb}
+                       UserFeature{queryGetUserDb, userFeatureServerEnv}
   = PackageContentsFeature{..}
   where
     packageFeatureInterface = (emptyHackageFeature "package-contents") {
@@ -160,7 +157,7 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
                                << if supposedToBeMarkdown filename
                                     then renderMarkdown filename contents
                                     else XHtml.thediv ! [XHtml.theclass "preformatted"]
-                                                     << unpackUtf8 contents
+                                                     << unpackUTF8 contents
                  ]
 
     serveReadmeText :: DynamicPath -> ServerPartE Response
@@ -194,7 +191,7 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
                             << if supposedToBeMarkdown filename
                                  then renderMarkdown filename contents
                                  else XHtml.thediv ! [XHtml.theclass "preformatted"]
-                                                  << unpackUtf8 contents
+                                                  << unpackUTF8 contents
               ]
 
     -- return: not-found error or tarball
@@ -205,15 +202,12 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
       case mTarball of
         Left err ->
           errNotFound "Could not serve package contents" [MText err]
-        Right (fp, etag, index) ->
-          tarServeResponse <$> serveTarball (display (packageId pkg) ++ " source tarball")
-                       [] (display (packageId pkg)) fp index
-                       [Public, maxAgeDays 30] etag Nothing
-
-unpackUtf8 :: BS.ByteString -> String
-unpackUtf8 = T.unpack
-           . T.decodeUtf8With T.lenientDecode
-           . BS.toStrict
+        Right (fp, etag, index) -> do
+          tarServe <-
+            serveTarball (display (packageId pkg) ++ " source tarball")
+                         [] (display (packageId pkg)) fp index
+                         [Public, maxAgeDays 30] etag Nothing
+          requireUserContent userFeatureServerEnv (tarServeResponse tarServe)
 
 -- TODO: this helper is defined in at least two other places; consolidate
 -- | URL describing a package.

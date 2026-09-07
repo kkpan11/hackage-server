@@ -33,8 +33,11 @@ Alternatively, open the [`nix develop`](https://nixos.org/manual/nix/stable/comm
     # if state directory does not already exist
     $ cabal v2-run -- hackage-server init --static-dir=datafiles --state-dir=state
 
-    $ cabal v2-run -- hackage-server run --static-dir=datafiles --state-dir=state --base-uri=http://127.0.0.1:8080
-    hackage-server: Ready! Point your browser at http://127.0.0.1:8080
+    $ cabal v2-run -- hackage-server run --static-dir=datafiles --state-dir=state \
+        --base-uri=http://localhost:8080 \
+        --required-base-host-header=localhost:8080 \
+        --user-content-uri=http://127.0.0.1:8080
+    hackage-server: Ready! Point your browser at http://localhost:8080
 
 #### Populate the local package index
 
@@ -77,7 +80,7 @@ You'll need to do the following to get `hackage-server`'s dependency `hs-captcha
 
   - Fedora/CentOS
 
-        sudo dnf install unzip libgd-devel
+        sudo dnf install unzip gd-devel
 
   - Nix/NixOS
 
@@ -98,7 +101,7 @@ You'll need to do the following to get `hackage-server`'s dependency `hs-captcha
 
   - Fedora/CentOS
 
-      sudo dnf install openssl-devel
+        sudo dnf install openssl-devel
 
 #### zlib
 
@@ -218,7 +221,10 @@ If you want to run the server directly from the build tree, run
 
 once to initialise the state. After that you can run the server with
 
-    cabal v2-run -- hackage-server run --static-dir=datafiles/ --base-uri=http://127.0.0.1:8080
+    cabal v2-run -- hackage-server run --static-dir=datafiles --state-dir=state \
+        --base-uri=http://127.0.0.1:8080 \
+        --required-base-host-header=localhost:8080 \
+        --user-content-uri=http://127.0.0.1:8080
 
 By default the server runs on port `8080` with the following settings:
 
