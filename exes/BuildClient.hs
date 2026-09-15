@@ -1,9 +1,10 @@
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import Network.HTTP hiding (password)
-import Network.Browser
+import Network.HTTP.Types.Header
+import Network.HTTP.Types.Status
 import Network.URI (URI(..))
 import Distribution.Client
 import Distribution.Client.Cron (cron, rethrowSignalsAsExceptions,
@@ -26,6 +27,7 @@ import Control.Applicative as App
 import Control.Exception
 import Control.Monad
 import Control.Monad.Trans
+import qualified Data.ByteString.Char8      as BSS
 import qualified Data.ByteString.Lazy       as BS
 import qualified Data.Map                   as M
 
@@ -588,9 +590,10 @@ processPkg verbosity opts config docInfo = do
     let installOk = fmap ("install-outcome: InstallOk" `isInfixOf`) buildReport == Just True
 
     -- Run Tests if installOk, Run coverage is Tests runs
-    (testOutcome, hpcLoc, testfile)   <- case installOk && docInfoRunTests docInfo of
+    (testOutcome, hpcLoc, testfile, testReportFile) <-
+      case installOk && docInfoRunTests docInfo of
       True  -> testPackage verbosity opts docInfo
-      False -> return (Nothing, Nothing, Nothing)
+      False -> return (Nothing, Nothing, Nothing, Nothing)
     coverageFile <- mapM (coveragePackage verbosity opts docInfo) hpcLoc
 
     -- Modify test-outcome and rewrite report file.
@@ -599,7 +602,8 @@ processPkg verbosity opts config docInfo = do
     case bo_dryRun opts of
       True -> return ()
       False -> uploadResults verbosity config docInfo
-                                    mTgz mRpt logfile testfile coverageFile installOk
+                                    mTgz mRpt logfile testfile coverageFile
+                                    testReportFile installOk
   where
     prepareTempBuildDir :: IO ()
     prepareTempBuildDir = do
@@ -609,7 +613,7 @@ processPkg verbosity opts config docInfo = do
       createDirectoryIfMissing True $ resultsDirectory opts
       notice verbosity $ "Writing cabal.project for " ++ display (docInfoPackage docInfo)
       let projectFile = installDirectory opts </> "cabal.project"
-      cabal opts "unpack" [show (docInfoTarGzURI config docInfo)] Nothing
+      cabal opts "unpack" [cabalPackageTarget config docInfo] Nothing
       writeFile projectFile $ "packages: */*.cabal" -- ++ show (docInfoTarGzURI config docInfo)
 
     setTestOutcome :: String -> [String] -> [String]
@@ -649,7 +653,7 @@ coveragePackage verbosity opts docInfo loc = do
   return coverageFile
 
 
-testPackage :: Verbosity -> BuildOpts -> DocInfo -> IO (Maybe String, Maybe FilePath, Maybe FilePath)
+testPackage :: Verbosity -> BuildOpts -> DocInfo -> IO (Maybe String, Maybe FilePath, Maybe FilePath, Maybe FilePath)
 testPackage verbosity opts docInfo = do
   let pkgid = docInfoPackage docInfo
       testLogFile = (installDirectory opts) </> display pkgid <.> "test"
@@ -682,7 +686,7 @@ testPackage verbosity opts docInfo = do
       [ "Test results for " ++ display pkgid ++ ":"
       , testResultFile
       ]
-  return (testOutcome, hpcLoc, Just testResultFile)
+  return (testOutcome, hpcLoc, Just testResultFile, Just testReportFile)
 
 
 -- | Build documentation and return @(Just tgz)@ for the built tgz file
@@ -754,14 +758,7 @@ buildPackage verbosity opts config docInfo = do
              "--haddock-hoogle",
              -- Generate the quickjump index files
              "--haddock-option=--quickjump",
-             -- For candidates we need to use the full URL, because
-             -- otherwise cabal-install will not find the package.
-             -- For regular packages however we need to use just the
-             -- package name, otherwise cabal-install will not
-             -- generate a report
-             if docInfoIsCandidate docInfo
-               then show (docInfoTarGzURI config docInfo)
-               else display pkgid
+             cabalPackageTarget config docInfo
              ]
 
     -- The installDirectory is purely temporary, while the resultsDirectory is
@@ -828,6 +825,18 @@ cabal opts cmd args moutput = do
                         Nothing Nothing moutput moutput
     waitForProcess ph
 
+cabalPackageTarget :: BuildConfig -> DocInfo -> String
+cabalPackageTarget config docInfo =
+    -- For candidates we need to use the full URL, because
+    -- otherwise cabal install/unpack will not find the package.
+    -- For regular packages however we need to use just the
+    -- package name, otherwise cabal install will not
+    -- generate a report and cabal unpack will not use the
+    -- latest cabal file revision from the package archive.
+    if docInfoIsCandidate docInfo
+        then show (docInfoTarGzURI config docInfo)
+        else display (docInfoPackage docInfo)
+
 pruneHaddockFiles :: FilePath -> IO ()
 pruneHaddockFiles dir = do
     -- Hackage doesn't support the haddock frames view, so remove it
@@ -864,58 +873,75 @@ pruneHaddockFiles dir = do
 
 tarGzDirectory :: FilePath -> IO BS.ByteString
 tarGzDirectory dir = do
-    res <- liftM (GZip.compress . Tar.write) $
-               Tar.pack containing_dir [nested_dir]
-    -- This seq is extremely important! Tar.pack is lazy, scanning
-    -- directories as entries are demanded.
+    entries <- Tar.pack' containing_dir [nested_dir]
+    tarcontents <- Tar.write' entries
+    let gzipped = GZip.compress tarcontents
+    -- This seq is extremely important! Tar.write' is lazy, reading
+    -- files as entries are demanded.
     -- This interacts very badly with the renameDirectory stuff with
     -- which tarGzDirectory gets wrapped.
-    BS.length res `seq` return res
+    BS.length gzipped `seq` return gzipped
   where (containing_dir, nested_dir) = splitFileName dir
 
 uploadResults :: Verbosity -> BuildConfig -> DocInfo -> Maybe FilePath
-                    -> Maybe FilePath -> FilePath -> Maybe FilePath -> Maybe FilePath -> Bool -> IO ()
+                    -> Maybe FilePath -> FilePath -> Maybe FilePath
+                    -> Maybe FilePath -> Maybe FilePath -> Bool -> IO ()
 uploadResults verbosity config docInfo
-              mdocsTarballFile buildReportFile buildLogFile testLogFile coverageFile installOk =
+              mdocsTarballFile buildReportFile buildLogFile testLogFile
+              coverageFile testReportFile installOk =
     httpSession verbosity "hackage-build" version $ do
-      -- Make sure we authenticate to Hackage
-      setAuthorityGen (provideAuthInfo (bc_srcURI config)
-                                       (Just (bc_username config, bc_password config)))
       case mdocsTarballFile of
         Nothing              -> return ()
         Just docsTarballFile ->
           putDocsTarball config docInfo docsTarballFile
 
-      putBuildFiles config docInfo buildReportFile buildLogFile testLogFile coverageFile installOk
+      putBuildFiles config docInfo buildReportFile buildLogFile testLogFile
+        coverageFile testReportFile installOk
+
+withAuth :: BuildConfig -> Request -> Request
+withAuth config req =
+    noRedirects $ applyBasicAuth (BSS.pack $ bc_username config) (BSS.pack $ bc_password config) req
 
 putDocsTarball :: BuildConfig -> DocInfo -> FilePath -> HttpSession ()
-putDocsTarball config docInfo docsTarballFile =
-    requestPUTFile (docInfoDocsURI config docInfo)
-      "application/x-tar" (Just "gzip") docsTarballFile
+putDocsTarball config docInfo docsTarballFile = do
+    body <- liftIO $ BS.readFile docsTarballFile
+    req <- withAuth config <$> mkUploadRequest "PUT" uri mimetype mEncoding [] body
+    runRequest req $ \rsp -> do
+        rsp' <- responseReadBSL rsp
+        checkStatus uri rsp'
+  where
+    uri = docInfoDocsURI config docInfo
+    mimetype = "application/x-tar"
+    mEncoding = Just "gzip"
 
 putBuildFiles :: BuildConfig -> DocInfo -> Maybe FilePath
-                    -> FilePath -> Maybe FilePath -> Maybe FilePath -> Bool -> HttpSession ()
-putBuildFiles config docInfo reportFile buildLogFile testLogFile coverageFile installOk = do
+                    -> FilePath -> Maybe FilePath -> Maybe FilePath
+                    -> Maybe FilePath -> Bool -> HttpSession ()
+putBuildFiles config docInfo reportFile buildLogFile testLogFile coverageFile
+              testReportFile installOk = do
     reportContent   <- liftIO $ traverse readFile reportFile
     logContent      <- liftIO $ readFile buildLogFile
     testContent     <- liftIO $ traverse readFile testLogFile
     coverageContent <- liftIO $ traverse readFile coverageFile
+    testReportCntnt <-
+      case testReportFile of
+        Nothing -> pure Nothing
+        Just fname -> do
+          exists <- liftIO $ doesFileExist fname
+          if exists
+             then Just <$> liftIO (readFile fname)
+             else pure Nothing
     let uri   = docInfoReports config docInfo
-        body  = encode $ BR.BuildFiles reportContent (Just logContent) testContent coverageContent (not installOk)
-    setAllowRedirects False
-    (_, response) <- request Request {
-      rqURI     = uri,
-      rqMethod  = PUT,
-      rqHeaders = [Header HdrContentType "application/json",
-                   Header HdrContentLength (show (BS.length body))],
-      rqBody    = body
-    }
-    case rspCode response of
-      --TODO: fix server to not do give 303, 201 is more appropriate
-      (3,0,3) -> return ()
-      _       -> do checkStatus uri response
+        body  = encode $ BR.BuildFiles reportContent (Just logContent) testContent coverageContent testReportCntnt (not installOk)
+    let headers = [ (hAccept, BSS.pack "application/json") ]
+    req <- withAuth config <$> mkUploadRequest (BSS.pack "PUT") uri "application/json" Nothing headers body
+    runRequest req $ \rsp -> do
+        case statusCode $ responseStatus rsp of
+          --TODO: fix server to not do give 303, 201 is more appropriate
+          303 -> return ()
+          _   -> do rsp' <- responseReadBSL rsp
+                    checkStatus uri rsp'
                     fail "Unexpected response from server."
-
 
 
 -------------------------

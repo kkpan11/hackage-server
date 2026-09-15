@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving, TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DerivingStrategies #-}
 module Distribution.Server.Users.Types (
     module Distribution.Server.Users.Types,
     module Distribution.Server.Users.AuthToken,
@@ -24,29 +25,29 @@ import qualified Data.List as L
 
 import Data.Aeson (ToJSON, FromJSON)
 import Data.SafeCopy (base, extension, deriveSafeCopy, Migrate(..))
-import Data.Typeable (Typeable)
 import Data.Hashable
+import Data.Serialize (Serialize)
 
 
 newtype UserId = UserId Int
-  deriving (Eq, Ord, Read, Show, Typeable, MemSize, ToJSON, FromJSON, Pretty)
+  deriving newtype (Eq, Ord, Read, Show, MemSize, ToJSON, FromJSON, Pretty)
 
 newtype UserName  = UserName String
-  deriving (Eq, Ord, Read, Show, Typeable, MemSize, ToJSON, FromJSON, Hashable)
+  deriving newtype (Eq, Ord, Read, Show, MemSize, ToJSON, FromJSON, Hashable, Serialize)
 
 data UserInfo = UserInfo {
                   userName   :: !UserName,
                   userStatus :: !UserStatus,
                   userTokens :: !(M.Map AuthToken T.Text) -- tokens and descriptions
-                } deriving (Eq, Show, Typeable)
+                } deriving (Eq, Show)
 
 data UserStatus = AccountEnabled  UserAuth
                 | AccountDisabled (Maybe UserAuth)
                 | AccountDeleted
-    deriving (Eq, Show, Typeable)
+    deriving (Eq, Show)
 
 newtype UserAuth = UserAuth PasswdHash
-    deriving (Show, Eq, Typeable)
+    deriving (Show, Eq)
 
 isActiveAccount :: UserStatus -> Bool
 isActiveAccount (AccountEnabled  _) = True
@@ -91,7 +92,7 @@ isValidUserNameChar c = (c < '\127' && Char.isAlphaNum c) || (c == '_')
 data UserInfo_v0 = UserInfo_v0 {
                   userName_v0   :: !UserName,
                   userStatus_v0 :: !UserStatus
-                } deriving (Eq, Show, Typeable)
+                } deriving (Eq, Show)
 
 $(deriveSafeCopy 0 'base ''UserId)
 $(deriveSafeCopy 0 'base ''UserName)
@@ -109,3 +110,16 @@ instance Migrate UserInfo where
         }
 
 $(deriveSafeCopy 1 'extension ''UserInfo)
+
+-- error codes
+data ErrUserNameClash = ErrUserNameClash
+data ErrUserIdClash   = ErrUserIdClash
+data ErrNoSuchUserId  = ErrNoSuchUserId
+data ErrDeletedUser   = ErrDeletedUser
+data ErrTokenNotOwned = ErrTokenNotOwned
+
+$(deriveSafeCopy 0 'base ''ErrUserNameClash)
+$(deriveSafeCopy 0 'base ''ErrUserIdClash)
+$(deriveSafeCopy 0 'base ''ErrNoSuchUserId)
+$(deriveSafeCopy 0 'base ''ErrDeletedUser)
+$(deriveSafeCopy 0 'base ''ErrTokenNotOwned)

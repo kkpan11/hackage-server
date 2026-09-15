@@ -33,6 +33,7 @@ import Distribution.Server.Features.Distro
 import Distribution.Server.Features.Documentation
 import Distribution.Server.Features.TarIndexCache
 import Distribution.Server.Features.UserDetails
+import Distribution.Server.Features.UserDetails.Types
 import Distribution.Server.Features.EditCabalFiles
 import Distribution.Server.Features.Html.HtmlUtilities
 import Distribution.Server.Features.Security.SHA256
@@ -66,9 +67,8 @@ import Data.List (intercalate, intersperse, insert)
 import Data.Function (on)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.Vector as Vec
 import qualified Data.Text as T
-import qualified Data.ByteString.Lazy.Char8 as BS (ByteString)
+import qualified Data.ByteString.Lazy as BS (LazyByteString, fromStrict)
 import qualified Network.URI as URI
 
 import Text.XHtml.Strict
@@ -650,7 +650,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
         pkgVotes      <- pkgNumVotes pkgname
         pkgScore      <- pkgNumScore pkgname
         auth          <- checkAuthenticated
-        userRating    <- case auth of Just (uid,_) -> pkgUserVote pkgname uid; _ -> return Nothing
+        userRating    <- case auth of Just uid -> pkgUserVote pkgname uid; _ -> return Nothing
         mdoctarblob   <- queryDocumentation realpkg
         tags          <- queryTagsForPackage pkgname
         rdeps         <- queryReverseDeps pkgname
@@ -669,10 +669,10 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
         userDb          <- queryGetUserDb
         maintainerlist  <- liftIO $ queryUserGroup maintainers
         let
-          idAndReport = fmap (\(rptId, rpt, _) -> (rptId, rpt)) rptStats
+          idAndReport = fmap (\(rptId, rpt, _, _) -> (rptId, rpt)) rptStats
           install = getInstall $ fmap (fst &&& BR.installOutcome . snd) idAndReport
           test    = getTest    $ fmap (        BR.testsOutcome   . snd) idAndReport
-          covg = getAvgCovg $ (\(_, _, cvg) -> cvg) =<< rptStats
+          covg = getAvgCovg $ (\(_, _, cvg, _) -> cvg) =<< rptStats
           loadDocMeta
             | Just doctarblob <- mdoctarblob
             , Just docIndex   <- mdocIndex
@@ -804,24 +804,25 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
       users    <- queryGetUserDb
       let pkgid        = packageId pkginfo
           pkgname      = packageName pkginfo
-          revisions    = reverse $ Vec.toList (pkgMetadataRevisions pkginfo)
+          cabalFiles   = reverse $ pkgAllRevisionsCabalFiles pkginfo
+          uploadInfos  = reverse $ pkgAllRevisionsUploadInfos pkginfo
           numRevisions = pkgNumRevisions pkginfo
 
           revchanges   :: [(SHA256Digest, [Change])]
-          revchanges   = start revisions where
+          revchanges   = start cabalFiles where
             start []          = []
             start (curr:rest) = go curr rest
 
-            go curr [] = [(sha256 (cabalFileByteString (fst curr)), [])]
+            go curr [] = [(sha256 (BS.fromStrict (cabalFileByteString curr)), [])]
             go curr (prev:rest) =
-                ( sha256 (cabalFileByteString (fst curr))
+                ( sha256 (BS.fromStrict (cabalFileByteString curr))
                 , changes curr prev )
                 : go prev rest
 
             changes curr prev = either (const []) id $
               diffCabalRevisionsByteString
-                (cabalFileByteString (fst prev))
-                (cabalFileByteString (fst curr))
+                (cabalFileByteString prev)
+                (cabalFileByteString curr)
 
       cacheControl [NoCache] (etagFromHash numRevisions)
       template <- getTemplate templates "revisions.html"
@@ -829,7 +830,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
         [ "pkgname"   $= pkgname
         , "pkgid"     $= pkgid
         , "revisions" $= zipWith3 (revisionToTemplate users)
-                                  (map snd revisions)
+                                  uploadInfos
                                   [numRevisions-1, numRevisions-2..]
                                   revchanges
         ]
@@ -849,7 +850,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
 
 
 -- | Common helper used by 'serveCandidatePage' and 'servePackagePage'
-makeReadme :: MonadIO m => PackageRender -> m (Maybe BS.ByteString)
+makeReadme :: MonadIO m => PackageRender -> m (Maybe BS.LazyByteString)
 makeReadme render = case rendReadme render of
   Just (tarfile, _, offset, _) ->
         either (\_err -> return Nothing) (return . Just . snd) =<<
@@ -1113,9 +1114,10 @@ mkHtmlReports HtmlUtilities{..} CoreFeature{..} UploadFeature{..} UserFeature{..
 
     servePackageReport :: DynamicPath -> ServerPartE Response
     servePackageReport dpath = do
-        (repid, report, mlog, mtest, covg) <- packageReport dpath
+        (repid, report, mlog, mtest, covg, testReportLog) <- packageReport dpath
         mlog' <- traverse queryBuildLog mlog
         mtest' <- traverse queryTestLog mtest
+        testReportLog' <- traverse queryTestReportLog testReportLog
         let covg' = fmap getCvgDet covg
         pkgid <- packageInPath dpath
         cacheControlWithoutETag [Public, maxAgeDays 30]
@@ -1125,6 +1127,7 @@ mkHtmlReports HtmlUtilities{..} CoreFeature{..} UploadFeature{..} UserFeature{..
           , "report" $= (repid, report)
           , "log" $= toMessage <$> mlog'
           , "test" $= toMessage <$> mtest'
+          , "testReport" $= toMessage <$> testReportLog'
           , "covg" $= covg'
           ]
       where

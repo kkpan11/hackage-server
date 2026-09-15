@@ -1,6 +1,6 @@
 {-# LANGUAGE RankNTypes, FlexibleContexts,
              NamedFieldPuns, RecordWildCards, PatternGuards #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase, MultiWayIf #-}
 module Distribution.Server.Features.Documentation (
     DocumentationFeature(..),
     DocumentationResource(..),
@@ -10,7 +10,7 @@ module Distribution.Server.Features.Documentation (
 import Distribution.Server.Features.Security.SHA256       (sha256)
 import Distribution.Server.Framework
 
-import Distribution.Server.Features.Documentation.State
+import qualified Distribution.Server.Features.Documentation.State as Acid
 import Distribution.Server.Features.Upload
 import Distribution.Server.Features.Users
 import Distribution.Server.Features.Core
@@ -110,24 +110,24 @@ initDocumentationFeature name
                                          documentationChangeHook
       return feature
 
-documentationStateComponent :: String -> FilePath -> IO (StateComponent AcidState Documentation)
+documentationStateComponent :: String -> FilePath -> IO (StateComponent AcidState Acid.Documentation)
 documentationStateComponent name stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> name) initialDocumentation
+  st <- openLocalStateFrom (stateDir </> "db" </> name) Acid.initialDocumentation
   return StateComponent {
       stateDesc    = "Package documentation"
     , stateHandle  = st
-    , getState     = query st GetDocumentation
-    , putState     = update st . ReplaceDocumentation
+    , getState     = query st Acid.GetDocumentation
+    , putState     = update st . Acid.ReplaceDocumentation
     , backupState  = \_ -> dumpBackup
-    , restoreState = updateDocumentation (Documentation Map.empty)
+    , restoreState = updateDocumentation (Acid.Documentation Map.empty)
     , resetState   = documentationStateComponent name
     }
   where
     dumpBackup doc =
         let exportFunc (pkgid, blob) = BackupBlob [display pkgid, "documentation.tar"] blob
-        in map exportFunc . Map.toList $ documentation doc
+        in map exportFunc . Map.toList $ Acid.documentation doc
 
-    updateDocumentation :: Documentation -> RestoreBackup Documentation
+    updateDocumentation :: Acid.Documentation -> RestoreBackup Acid.Documentation
     updateDocumentation docs = RestoreBackup {
         restoreEntry = \entry ->
           case entry of
@@ -139,9 +139,9 @@ documentationStateComponent name stateDir = do
       , restoreFinalize = return docs
       }
 
-    importDocumentation :: PackageId -> BlobId -> Documentation -> Restore Documentation
-    importDocumentation pkgId blobId (Documentation docs) =
-      return (Documentation (Map.insert pkgId blobId docs))
+    importDocumentation :: PackageId -> BlobId -> Acid.Documentation -> Restore Acid.Documentation
+    importDocumentation pkgId blobId (Acid.Documentation docs) =
+      return (Acid.Documentation (Map.insert pkgId blobId docs))
 
 documentationFeature :: String
                      -> ServerEnv
@@ -152,7 +152,7 @@ documentationFeature :: String
                      -> ReportsFeature
                      -> UserFeature
                      -> VersionsFeature
-                     -> StateComponent AcidState Documentation
+                     -> StateComponent AcidState Acid.Documentation
                      -> Hook PackageId ()
                      -> DocumentationFeature
 documentationFeature name
@@ -186,14 +186,14 @@ documentationFeature name
       }
 
     queryHasDocumentation :: MonadIO m => PackageIdentifier -> m Bool
-    queryHasDocumentation pkgid = queryState documentationState (HasDocumentation pkgid)
+    queryHasDocumentation pkgid = queryState documentationState (Acid.HasDocumentation pkgid)
 
     queryDocumentation :: MonadIO m => PackageIdentifier -> m (Maybe BlobId)
-    queryDocumentation pkgid = queryState documentationState (LookupDocumentation pkgid)
+    queryDocumentation pkgid = queryState documentationState (Acid.LookupDocumentation pkgid)
 
     queryDocumentationIndex :: MonadIO m => m (Map.Map PackageId BlobId)
     queryDocumentationIndex =
-      liftM documentation (queryState documentationState GetDocumentation)
+      liftM Acid.documentation (queryState documentationState Acid.GetDocumentation)
 
     documentationResource = fix $ \r -> DocumentationResource {
         packageDocsContent = (extendResourcePath "/docs/.." corePackagePage) {
@@ -310,12 +310,25 @@ documentationFeature name
                 case dpath of
                   ("..","doc-index.json") : _ -> True
                   _ -> False
-            if mtime < UTCTime (fromGregorian 2025 2 1) 0
-               || isDocIndex
-               || digest == "548d676b3e5a52cbfef06d7424ec065c1f34c230407f9f5dc002c27a9666bec4" -- quick-jump.min.js
-               || digest == "6bd159f6d7b1cfef1bd190f1f5eadcd15d35c6c567330d7465c3c35d5195bc6f" -- quick-jump.css
-               then pure response
-               else requireUserContent env response
+              hashesToCheck =
+                case dpath of
+                  ("..", "quick-jump.min.js") : _ -> Just quickJumpJsKnownGoodSha256
+                  ("..", "quick-jump.css")    : _ -> Just quickJumpCssKnownGoodSha256
+                  _                               -> Nothing
+            if
+              | isDocIndex ->
+                  pure response
+              | Just hashes <- hashesToCheck ->
+                  -- Because Quick Jump also runs on the package page,
+                  -- and not just on the user content domain,
+                  -- we cannot accept arbitrary user-uploaded content.
+                  if digest `elem` hashes
+                    then pure response
+                    else errForbidden "Quick Jump hash is not correct" [MText "Accepted Quick Jump hashes are listed in the hackage-server source code."]
+              | mtime < UTCTime (fromGregorian 2025 2 1) 0 ->
+                  pure response
+              | otherwise ->
+                  requireUserContent env response
 
     rewriteDocs :: BSL.ByteString -> BSL.ByteString
     rewriteDocs dochtml = case BSL.breakFindAfter (BS.pack "<head>") dochtml of
@@ -350,12 +363,12 @@ documentationFeature name
       fileContents <- expectCompressedTarball
       let filename = display pkgid ++ "-docs" <.> "tar.gz"
           unpacked = Gzip.decompressNamed filename fileContents
-      mres <- liftIO $ BlobStorage.addWith store unpacked 
+      mres <- liftIO $ BlobStorage.addWith store unpacked
                          (\content -> return (checkDocTarball pkgid content))
       case mres of
         Left  err -> errBadRequest "Invalid documentation tarball" [MText err]
         Right ((), blobid) -> do
-          updateState documentationState $ InsertDocumentation pkgid blobid
+          updateState documentationState $ Acid.InsertDocumentation pkgid blobid
           runHook_ documentationChangeHook pkgid
           noContent (toResponse ())
 
@@ -388,7 +401,7 @@ documentationFeature name
       pkgid <- packageInPath dpath
       guardValidPackageId pkgid
       guardAuthorisedAsMaintainerOrTrustee (packageName pkgid)
-      updateState documentationState $ RemoveDocumentation pkgid
+      updateState documentationState $ Acid.RemoveDocumentation pkgid
       runHook_ documentationChangeHook pkgid
       noContent (toResponse ())
 
@@ -452,7 +465,7 @@ documentationFeature name
                 tempRedirect latestPkgPath (toResponse "")
               Nothing -> errNotFoundH "Not Found" [MText "There is no documentation for this package."]
         False -> do
-          mdocs <- queryState documentationState $ LookupDocumentation pkgid
+          mdocs <- queryState documentationState $ Acid.LookupDocumentation pkgid
           case mdocs of
             Nothing ->
               errNotFoundH "Not Found"
@@ -510,3 +523,64 @@ mapParaM f = mapM (\x -> (,) x <$> f x)
 
 getFileAge :: FilePath -> IO NominalDiffTime
 getFileAge file = diffUTCTime <$> getCurrentTime <*> getModificationTime file
+
+quickJumpJsKnownGoodSha256 :: [String]
+quickJumpJsKnownGoodSha256 =
+  [
+    -- commit: e99aefb50ca63e2dbcc95841efbb53cea90151d8 (Sep 23 2017)
+    -- object: c9f2b445b9
+    "e1da96b0d7ab3d72cfe3786def923c5af91ba331858852f1f43a1acfc5ee6966"
+
+    -- commit: 8e88615a23a9f1980a55bd1b3ef9dcc938d95237 (Oct 10 2017)
+    -- object: cb24f8bdea
+  , "a273a3ef19c21032afc5f65d1e09933146f183da906ca9d0b4c285095539e0e7"
+
+    -- commit: b4982d87f41d9a4d3f6237bacfd819145723e35b (Oct 30 2017)
+    -- object: f22f8f2881
+  , "8aed621ac2b746751585cbe271631394cacc0e01cca4ef589e11b077b0acd291"
+
+    -- commit: 93c1e6eb9e829a66ff213ec076d529ab008880b3 (Dec 16 2017)
+    -- object: bfdf04a372
+  , "4b10c18a7ad35f032e8cdc0d263716a93878bf06d998b1b66dccff06ceeee89d"
+
+    -- commit: 59812a09eb69cbf12407206381f4c214987b1efd (Apr 3 2018)
+    -- object: c03e083607
+  , "ce86bba43edb0534c0faa2d6d0f504877576c5271321e3fbd9638fd4667384a2"
+
+    -- commit: a69311708493efe8524aed0e9d19365f79f2fab3 (Oct 24 2018)
+    -- object: 06c35c7454
+  , "548d676b3e5a52cbfef06d7424ec065c1f34c230407f9f5dc002c27a9666bec4"
+
+    -- commit: 7776566531e72c415f66dd3b13da9041c52076aa (Nov 13 2019)
+    -- object: 0b0eeb27d1
+  , "7ca43fc2058574846e032bc5493a0ad4568e4fa14fb58558fbf48d3bd6693e59"
+  ]
+
+
+quickJumpCssKnownGoodSha256 :: [String]
+quickJumpCssKnownGoodSha256 =
+  [
+    -- commit: d41abb0f606bf5fdbdc0a7bd3758e0c30601b121 (Sep 23 2017)
+    -- object: b69903c3
+    "f95b8b12a8a13dd31add93527e1239fdff6997c7f2396e975e2e415db04b75fb"
+
+    -- commit: 0997eb61803a37803ddb6cf7116eb9db1046b2ce (Oct 10 2017)
+    -- object: ede05042
+  , "59693ef3f0d793031b3af58b214af7884c0f63ce6db659ffd7432cf0aa852b51"
+
+    -- commit: fc069bf200f930c21f96ddbbec1d7c5c69f8ba72 (Jan 15 2018)
+    -- object: 468d8036
+  , "1d51573b72bc8a7b9b0dda3beffb7882db78d22a37840203f761e3969d915027"
+
+    -- commit: fa5ec121e2a700137bab8bd48cc30b1e80f58fd4 (Feb 27 2019)
+    -- object: 8772809c
+  , "29fe483bd37ad3feba12f646e9661731127526f246c246b0011b384e11649dff"
+
+    -- commit: 05ccce6e07731f9788a434d6e06f4cadeff3d6ba (Dec 8 2020)
+    -- object: d656f51c
+  , "6997c223e09b340f5f1bb970c930b458f768a0bbbe787cb87f181820a3d122b3"
+
+    -- commit: 9511e587701349093cbe3ac7c00f13583820774f (Feb 7 2021)
+    -- object: cf10eee4
+  , "6bd159f6d7b1cfef1bd190f1f5eadcd15d35c6c567330d7465c3c35d5195bc6f"
+  ]

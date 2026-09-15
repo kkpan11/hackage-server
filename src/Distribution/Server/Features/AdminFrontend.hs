@@ -7,11 +7,12 @@ module Distribution.Server.Features.AdminFrontend (
 
 import Distribution.Server.Framework
 import Distribution.Server.Framework.Templating
+import Distribution.Server.Features.UserSignup.Types
 
 import Distribution.Server.Features.Users
 import Distribution.Server.Features.UserDetails
+import Distribution.Server.Features.UserDetails.Types
 import Distribution.Server.Features.UserSignup
-import Distribution.Server.Features.LegacyPasswds
 
 import Distribution.Server.Users.Types
 import qualified Distribution.Server.Users.Users as Users
@@ -30,7 +31,6 @@ initAdminFrontendFeature :: ServerEnv
                          -> IO (UserFeature
                              -> UserDetailsFeature
                              -> UserSignupFeature
-                             -> LegacyPasswdsFeature
                              -> IO HackageFeature)
 initAdminFrontendFeature env@ServerEnv{ serverTemplatesDir,
                                         serverTemplatesMode } = do
@@ -38,12 +38,12 @@ initAdminFrontendFeature env@ServerEnv{ serverTemplatesDir,
     templates <- loadTemplates serverTemplatesMode
                    [serverTemplatesDir, serverTemplatesDir </> "AdminFrontend"]
                    [ "admin.html", "accounts.html", "account.html"
-                   , "signups.html", "resets.html", "legacy.html" ]
+                   , "signups.html", "resets.html" ]
 
-    return $ \user userdetails usersignup legacypasswds -> do
+    return $ \user userdetails usersignup -> do
       let feature = adminFrontendFeature env templates
                                          user userdetails
-                                         usersignup legacypasswds
+                                         usersignup
 
       return feature
 
@@ -52,11 +52,10 @@ adminFrontendFeature :: ServerEnv -> Templates
                      -> UserFeature
                      -> UserDetailsFeature
                      -> UserSignupFeature
-                     -> LegacyPasswdsFeature
                      -> HackageFeature
 adminFrontendFeature _env templates
                      UserFeature{..} UserDetailsFeature{..}
-                     UserSignupFeature{..} LegacyPasswdsFeature{..} =
+                     UserSignupFeature{..} =
   (emptyHackageFeature "admin-frontend") {
     featureResources =
       [ adminPortalResource
@@ -64,7 +63,6 @@ adminFrontendFeature _env templates
       , adminAccountResource
       , adminSignupsResource
       , adminResetsResource
-      , adminLegacyResource
       ]
   , featureState = []
   , featureReloadFiles = reloadTemplates templates
@@ -95,11 +93,6 @@ adminFrontendFeature _env templates
       (resourceAt "/admin/resets")  {
         resourceDesc = [(GET,  "All password reset requests")],
         resourceGet  = [("html", serveAdminResetsGet)]
-      }
-    adminLegacyResource =
-      (resourceAt "/admin/legacy")  {
-        resourceDesc = [(GET,  "All accounts with legacy passwords")],
-        resourceGet  = [("html", serveAdminLegacyGet)]
       }
 
     serveAdminPortalGet :: DynamicPath -> ServerPartE Response
@@ -195,20 +188,6 @@ adminFrontendFeature _env templates
                         ]
           ]
 
-    serveAdminLegacyGet :: DynamicPath -> ServerPartE Response
-    serveAdminLegacyGet _ = do
-        guardAuthorised_ [InGroup adminGroup]
-        cacheControlWithoutETag [Private]
-        template     <- getTemplate templates "legacy.html"
-        usersdb      <- queryGetUserDb
-        legacyUsers  <- enumerateAllUserLegacyPasswd <$> queryLegacyPasswds
-        ok $ toResponse $ template
-          [ "accounts" $= [ accountBasicInfoToTemplate uid uinfo
-                          | uid <- legacyUsers
-                          , let Just uinfo = Users.lookupUserId uid usersdb
-                          ]
-          ]
-
     resetRequestToTemplate :: SignupResetInfo -> UserInfo -> TemplateVal
     resetRequestToTemplate ResetInfo {nonceTimestamp, resetUserId} uinfo =
       templateDict
@@ -226,13 +205,11 @@ adminFrontendFeature _env templates
         uinfo     <- lookupUserInfo uid
         mudetails <- queryUserDetails uid
         resetInfo <- lookupPasswordReset uid <$> queryAllSignupResetInfo
-        mlegacy   <- lookupUserLegacyPasswd uid <$> queryLegacyPasswds
 
         ok $ toResponse $ template
           [ "account" $= accountBasicInfoToTemplate uid uinfo
           , "details" $= accountDetailsToTemplate uinfo mudetails
           , "resetRequests"     $= resetInfo
-          , "hasLegacyPassword" $= isJust mlegacy
           ]
       where
         lookupPasswordReset uid allResetInfo =

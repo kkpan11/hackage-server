@@ -42,6 +42,7 @@ import Distribution.Types.VersionInterval.Legacy
   -- I criticized this unfortunate development at length at:
   -- https://github.com/haskell/cabal/issues/7916
 import Distribution.ModuleName as ModuleName
+import Distribution.Types.LibraryVisibility (LibraryVisibility(LibraryVisibilityPublic))
 
 -- hackage-server
 import Distribution.Server.Framework.CacheControl (ETag)
@@ -86,7 +87,7 @@ data PackageRender = PackageRender {
     rendChangeLog    :: Maybe (FilePath, ETag, TarEntryOffset, FilePath),
     rendReadme       :: Maybe (FilePath, ETag, TarEntryOffset, FilePath),
     rendUploadInfo   :: (UTCTime, Maybe UserInfo),
-    rendUpdateInfo   :: Maybe (Int, UTCTime, Maybe UserInfo),
+    rendUpdateInfo   :: Maybe (MetadataRevIx, UTCTime, Maybe UserInfo),
     rendPkgUri       :: String,
     rendFlags        :: [PackageFlag],
     -- rendOther contains other useful fields which are merely strings, possibly empty
@@ -118,15 +119,15 @@ doPackageRender users info = PackageRender
                            str -> categorySplit str
     , rendRepoHeads    = catMaybes (map rendRepo $ sourceRepos desc)
     , rendModules      = renderModules
-    , rendHasTarball   = not . Vec.null $ pkgTarballRevisions info
+    , rendHasTarball   = not . null $ pkgAllTarballs info
     , rendChangeLog    = Nothing -- populated later
     , rendReadme       = Nothing -- populated later
     , rendUploadInfo   = let (utime, uid) = pkgOriginalUploadInfo info
                          in (utime, Users.lookupUserId uid users)
-    , rendUpdateInfo   = let maxrevision  = Vec.length (pkgMetadataRevisions info) - 1
+    , rendUpdateInfo   = let maxrevision  = pkgMaxRevision info
                              (utime, uid) = pkgLatestUploadInfo info
                              uinfo        = Users.lookupUserId uid users
-                         in if maxrevision > 0
+                         in if maxrevision > MetadataRevIx 0
                               then Just (maxrevision, utime, uinfo)
                               else Nothing
     , rendPkgUri       = pkgUri
@@ -148,7 +149,7 @@ doPackageRender users info = PackageRender
                                else NotBuildable
 
     renderModules :: Maybe TarIndex -> [(LibraryName, ModSigIndex)]
-    renderModules docindex = flip fmap (allLibraries flatDesc) $ \lib ->
+    renderModules docindex = flip fmap (filter isPublicLibrary $ allLibraries flatDesc) $ \lib ->
       let mod_ix = mkForest $ exposedModules lib
                            -- Assumes that there is an HTML per reexport
                            ++ map moduleReexportName (reexportedModules lib)
@@ -156,6 +157,9 @@ doPackageRender users info = PackageRender
           sig_ix = mkForest $ signatures lib
           mkForest = moduleForest . map (\m -> (m, moduleHasDocs docindex m))
       in (libName lib, ModSigIndex { modIndex = mod_ix, sigIndex = sig_ix })
+      where
+        -- Only show main library or internal libraries with public visibility
+        isPublicLibrary lib = libVisibility lib == LibraryVisibilityPublic
 
     moduleHasDocs :: Maybe TarIndex -> ModuleName -> Bool
     moduleHasDocs Nothing       = const False

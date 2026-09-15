@@ -4,6 +4,7 @@ module Distribution.Server.Features.PreferredVersions (
     VersionsFeature(..),
     VersionsResource(..),
     initVersionsFeature,
+    sumRange,
 
     PreferredInfo(..),
     VersionStatus(..),
@@ -12,12 +13,15 @@ module Distribution.Server.Features.PreferredVersions (
 
     PreferredRender(..),
     preferredStateComponent,
+
+    maybeBestVersion,
   ) where
 
 import Distribution.Server.Framework
 
 import Distribution.Server.Features.PreferredVersions.State
 import Distribution.Server.Features.PreferredVersions.Backup
+import Distribution.Server.Features.PreferredVersions.Types
 
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Upload
@@ -42,6 +46,8 @@ import qualified Data.Aeson.Key             as Key
 import qualified Data.Aeson.KeyMap          as KeyMap
 import qualified Data.ByteString.Lazy.Char8 as BS (pack) -- Only used for ASCII data
 import qualified Data.Map                   as Map
+import Data.Set (Set)
+import qualified Data.Set                   as Set
 import qualified Data.Text                  as Text
 import qualified Data.Vector                as Vector
 
@@ -213,7 +219,6 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
               $ map packageVersion pkgs
         versionType NormalVersion = "normal-version"
         versionType DeprecatedVersion = "deprecated-version"
-        versionType UnpreferredVersion = "unpreferred-version"
       return . toResponse . object
         $ map (\(i, vs) -> (versionType i, array $ map (string . display) vs))
           $ Map.toList classifiedVersions
@@ -380,7 +385,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     renderPrefInfo :: PreferredInfo -> PreferredRender
     renderPrefInfo pref = PreferredRender {
         rendSumRange = maybe "-any" display $ sumRange pref,
-        rendRanges   = map display $ preferredRanges pref,
+        rendRanges   = [],
         rendVersions = deprecatedVersions pref
     }
 
@@ -452,3 +457,89 @@ object = Object . KeyMap.fromList . map (first Key.fromString)
 
 string :: String -> Value
 string = String . Text.pack
+
+---------------
+
+getVersionStatus :: PreferredInfo -> Version -> VersionStatus
+getVersionStatus info version
+    | version `elem` deprecatedVersions info = DeprecatedVersion
+    | otherwise = NormalVersion
+
+classifyVersions :: PreferredInfo -> [Version] -> [(Version, VersionStatus)]
+classifyVersions (PreferredInfo [] [] _) = map (flip (,) NormalVersion)
+classifyVersions info = map ((,) `ap` getVersionStatus info)
+
+maybeBestVersion :: PreferredInfo -> [Version] -> Set Version -> Maybe (Version, Maybe VersionStatus)
+maybeBestVersion info allVersions versions = if null allVersions || Set.null versions then Nothing else Just $ findBestVersion info allVersions versions
+
+{-
+findBestVersion attempts to find the best version to display out of a set
+of versions. The quality of a given version is encoded in a pair (VersionStatus,
+Bool). If the version is a NormalVersion, then the boolean indicates whether if
+it the most recently uploaded preferred version (and all higher versions are
+either deprecated or unpreferred). Otherwise, if it  is a DeprecatedVersion,
+the boolean indicates that it is the maximum of all uploaded versions.
+
+The list of available versions is scanned from the back (most recent) to the
+front (first one uploaded). If a 'better' version is found than the current
+best version, it is replaced. If no better version can be found, the algorithm
+finishes up. The exact ordering is defined as:
+
+1. (NormalVersion, True) means the latest preferred version of the package is
+available. This option may appear anywhere, although it is always seen before
+(NormalVersion, False). In this case, the algorithm finishes up.
+
+2. (NormalVersion, False) means neither the actual latest version nor the
+preferred latest version are available, but there is some preferred version
+that's available. It can only be scanned after (NormalVersion, True) so the
+algorithm finishes up in this case.
+
+3. (DeprecatedVersion, True) and (DeprecatedVersion, False) mean only a
+deprecated version is available. This is not so great.
+
+This is a bit complex but I think it has the most intuitive result, and is
+rather efficient in 99% of cases.
+
+The version set and version list should both be non-empty; otherwise this
+function is partial. Use maybeBestVersion for a safe check.
+
+-}
+findBestVersion :: PreferredInfo -> [Version] -> Set Version -> (Version, Maybe VersionStatus)
+findBestVersion info allVersions versions =
+    let topStatus = getVersionStatus info maxVersion
+    in if maxAllVersion == maxVersion && topStatus == NormalVersion
+        then (maxVersion, Just NormalVersion) -- most common case
+        else second classifyOpt $ newSearch (reverse $ Set.toList versions) (maxVersion, (topStatus, True))
+  where
+    maxVersion = Set.findMax versions
+    maxAllVersion = last allVersions
+
+    newestPreferred = case filter ((==NormalVersion) . (infoMap Map.!)) allVersions of
+        []    -> Nothing
+        prefs -> Just $ last prefs
+
+    infoMap = Map.fromDistinctAscList $ classifyVersions info allVersions
+
+    newSearch (v:vs) _ = case infoMap Map.! v of
+        NormalVersion | v == maxAllVersion -> (v, (NormalVersion, True))
+        NormalVersion -> oldSearch vs (v, (NormalVersion, False))
+        DeprecatedVersion -> newSearch vs (v, (DeprecatedVersion, True))
+    newSearch [] opt = opt
+
+    oldSearch (v:vs) opt = case infoMap Map.! v of
+        NormalVersion -> replaceBetter opt (v, (NormalVersion, newestPreferred == Just v))
+        other -> oldSearch vs $ replaceBetter opt (v, (other, False))
+    oldSearch [] opt = opt
+
+    replaceBetter keep@(_, old) replace@(_, new) = if optionPrefs new > optionPrefs old then replace else keep
+
+    optionPrefs :: (VersionStatus, Bool) -> Int
+    optionPrefs opt = case opt of
+        (NormalVersion, True) -> 4
+        (NormalVersion, False) -> 2
+        _ -> 0
+
+    classifyOpt opt = case opt of
+        (NormalVersion, True) -> Just NormalVersion
+        (DeprecatedVersion, _) -> Just DeprecatedVersion
+        _ -> Nothing
