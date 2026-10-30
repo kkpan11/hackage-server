@@ -1,23 +1,27 @@
+{-# LANGUAGE NamedFieldPuns  #-}
+{-# LANGUAGE RankNTypes      #-}
+{-# LANGUAGE RecordWildCards #-}
+
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
-{-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving,
-             TypeFamilies, TemplateHaskell,
-             RankNTypes, NamedFieldPuns, RecordWildCards, BangPatterns #-}
+
 module Distribution.Server.Features.UserSignup (
     initUserSignupFeature,
     UserSignupFeature(..),
-    SignupResetInfo(..),
 
     accountSuitableForPasswordReset
   ) where
 
+import qualified Distribution.Server.Features.UserSignup.Acid as Acid
+import qualified Distribution.Server.Features.UserSignup.Store as Store
+import Distribution.Server.Features.UserSignup.Types
+
 import Distribution.Server.Framework
 import Distribution.Server.Framework.Templating
-import Distribution.Server.Framework.BackupDump
-import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Features.Upload
 import Distribution.Server.Features.Users
 import Distribution.Server.Features.UserDetails
+import Distribution.Server.Features.UserDetails.Types
 
 import Distribution.Server.Users.Group
 import Distribution.Server.Users.Types
@@ -25,21 +29,14 @@ import Distribution.Server.Util.Nonce
 import Distribution.Server.Util.Validators
 import qualified Distribution.Server.Users.Users as Users
 
-import Data.Map (Map)
-import qualified Data.Map as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.ByteString.Char8 as BS -- Only used for ASCII data
 import qualified Data.ByteString.Lazy as BSL
-import Data.Typeable (Typeable)
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, put, modify)
-import Data.SafeCopy (base, deriveSafeCopy)
 
 import Distribution.Text (display)
 import Data.Time
-import Text.CSV (CSV, Record)
 import Network.Mail.Mime
 import Network.URI (URI(..), URIAuth(..))
 import Graphics.Captcha
@@ -91,187 +88,6 @@ instance IsHackageFeature UserSignupFeature where
 --      set new password
 --
 
--------------------------
--- Types of stored data
---
-
-data SignupResetInfo = SignupInfo {
-                         signupUserName     :: !Text,
-                         signupRealName     :: !Text,
-                         signupContactEmail :: !Text,
-                         nonceTimestamp     :: !UTCTime
-                       }
-                     | ResetInfo {
-                         resetUserId        :: !UserId,
-                         nonceTimestamp     :: !UTCTime
-                     }
-  deriving (Eq, Show, Typeable)
-
-newtype SignupResetTable = SignupResetTable (Map Nonce SignupResetInfo)
-  deriving (Eq, Show, Typeable, MemSize)
-
-emptySignupResetTable :: SignupResetTable
-emptySignupResetTable = SignupResetTable Map.empty
-
-instance MemSize SignupResetInfo where
-    memSize (SignupInfo a b c d) = memSize4 a b c d
-    memSize (ResetInfo  a b)     = memSize2 a b
-
-$(deriveSafeCopy 0 'base ''SignupResetInfo)
-$(deriveSafeCopy 0 'base ''SignupResetTable)
-
-------------------------------
--- State queries and updates
---
-
-getSignupResetTable :: Query SignupResetTable SignupResetTable
-getSignupResetTable = ask
-
-replaceSignupResetTable :: SignupResetTable -> Update SignupResetTable ()
-replaceSignupResetTable = put
-
-lookupSignupResetInfo :: Nonce -> Query SignupResetTable (Maybe SignupResetInfo)
-lookupSignupResetInfo nonce = do
-    SignupResetTable tbl <- ask
-    return $! Map.lookup nonce tbl
-
-addSignupResetInfo :: Nonce -> SignupResetInfo -> Update SignupResetTable Bool
-addSignupResetInfo nonce info = do
-    SignupResetTable tbl <- get
-    if not (Map.member nonce tbl)
-      then do put $! SignupResetTable (Map.insert nonce info tbl)
-              return True
-      else return False
-
-deleteSignupResetInfo :: Nonce -> Update SignupResetTable ()
-deleteSignupResetInfo nonce = do
-    SignupResetTable tbl <- get
-    put $! SignupResetTable (Map.delete nonce tbl)
-
-deleteAllExpired :: UTCTime -> Update SignupResetTable ()
-deleteAllExpired expireTime =
-    modify $ \(SignupResetTable tbl) ->
-      SignupResetTable $
-        Map.filter (\entry -> nonceTimestamp entry > expireTime) tbl
-
-makeAcidic ''SignupResetTable [
-    --queries
-    'getSignupResetTable,
-    'lookupSignupResetInfo,
-    --updates
-    'replaceSignupResetTable,
-    'addSignupResetInfo,
-    'deleteSignupResetInfo,
-    'deleteAllExpired
-  ]
-
-
----------------------
--- State components
---
-
-signupResetStateComponent :: FilePath -> IO (StateComponent AcidState SignupResetTable)
-signupResetStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "UserSignupReset") emptySignupResetTable
-  return StateComponent {
-      stateDesc    = "State to keep track of outstanding requests for user signup and password resets"
-    , stateHandle  = st
-    , getState     = query st GetSignupResetTable
-    , putState     = update st . ReplaceSignupResetTable
-    , backupState  = \backuptype tbl ->
-        [csvToBackup ["signups.csv"] (signupInfoToCSV backuptype tbl)
-        ,csvToBackup ["resets.csv"]  (resetInfoToCSV backuptype tbl)]
-    , restoreState = signupResetBackup
-    , resetState   = signupResetStateComponent
-    }
-
-----------------------------
--- Data backup and restore
---
-
-signupResetBackup :: RestoreBackup SignupResetTable
-signupResetBackup = go []
-  where
-   go :: [(Nonce, SignupResetInfo)] -> RestoreBackup SignupResetTable
-   go st =
-     RestoreBackup {
-       restoreEntry = \entry -> case entry of
-         BackupByteString ["signups.csv"] bs -> do
-           csv <- importCSV "signups.csv" bs
-           signups <- importSignupInfo csv
-           return (go (signups ++ st))
-
-         BackupByteString ["resets.csv"] bs -> do
-           csv <- importCSV "resets.csv" bs
-           resets <- importResetInfo csv
-           return (go (resets ++ st))
-
-         _ -> return (go st)
-
-     , restoreFinalize =
-        return (SignupResetTable (Map.fromList st))
-     }
-
-importSignupInfo :: CSV -> Restore [(Nonce, SignupResetInfo)]
-importSignupInfo = mapM fromRecord . drop 2
-  where
-    fromRecord :: Record -> Restore (Nonce, SignupResetInfo)
-    fromRecord [nonceStr, usernameStr, realnameStr, emailStr, timestampStr] = do
-        timestamp <- parseUTCTime "timestamp" timestampStr
-        nonce <- parseNonceM nonceStr
-        let signupinfo = SignupInfo {
-              signupUserName     = T.pack usernameStr,
-              signupRealName     = T.pack realnameStr,
-              signupContactEmail = T.pack emailStr,
-              nonceTimestamp     = timestamp
-            }
-        return (nonce, signupinfo)
-    fromRecord x = fail $ "Error processing signup info record: " ++ show x
-
-signupInfoToCSV :: BackupType -> SignupResetTable -> CSV
-signupInfoToCSV backuptype (SignupResetTable tbl)
-    = ["0.1"]
-    : [ "token", "username", "realname", "email", "timestamp" ]
-    : [ [ if backuptype == FullBackup
-          then renderNonce nonce
-          else ""
-        , T.unpack signupUserName
-        , T.unpack signupRealName
-        , if backuptype == FullBackup
-          then T.unpack signupContactEmail
-          else "hidden-email@nowhere.org"
-        , formatUTCTime nonceTimestamp
-        ]
-      | (nonce, SignupInfo{..}) <- Map.toList tbl ]
-
-importResetInfo :: CSV -> Restore [(Nonce, SignupResetInfo)]
-importResetInfo = mapM fromRecord . drop 2
-  where
-    fromRecord :: Record -> Restore (Nonce, SignupResetInfo)
-    fromRecord [nonceStr, useridStr, timestampStr] = do
-        userid <- parseText "userid" useridStr
-        timestamp <- parseUTCTime "timestamp" timestampStr
-        nonce <- parseNonceM nonceStr
-        let signupinfo = ResetInfo {
-              resetUserId    = userid,
-              nonceTimestamp = timestamp
-            }
-        return (nonce, signupinfo)
-    fromRecord x = fail $ "Error processing signup info record: " ++ show x
-
-resetInfoToCSV :: BackupType -> SignupResetTable -> CSV
-resetInfoToCSV backuptype (SignupResetTable tbl)
-    = ["0.1"]
-    : [ "token", "userid", "timestamp" ]
-    : [ [ if backuptype == FullBackup
-          then renderNonce nonce
-          else ""
-        , display resetUserId
-        , formatUTCTime nonceTimestamp
-        ]
-      | (nonce, ResetInfo{..}) <- Map.toList tbl ]
-
-
 ----------------------------------------
 -- Feature definition & initialisation
 --
@@ -284,7 +100,7 @@ initUserSignupFeature :: ServerEnv
 initUserSignupFeature env@ServerEnv{ serverStateDir, serverTemplatesDir,
                                      serverTemplatesMode } = do
     -- Canonical state
-    signupResetState <- signupResetStateComponent serverStateDir
+    signupResetBackend <- Acid.acidStore serverStateDir
 
     -- Page templates
     templates <- loadTemplates serverTemplatesMode
@@ -297,7 +113,7 @@ initUserSignupFeature env@ServerEnv{ serverStateDir, serverTemplatesDir,
     return $ \users userdetails upload -> do
       let feature = userSignupFeature env
                       users userdetails upload
-                      signupResetState templates
+                      signupResetBackend templates
       return feature
 
 
@@ -305,15 +121,17 @@ userSignupFeature :: ServerEnv
                   -> UserFeature
                   -> UserDetailsFeature
                   -> UploadFeature
-                  -> StateComponent AcidState SignupResetTable
+                  -> Store.Backend
                   -> Templates
                   -> UserSignupFeature
 userSignupFeature ServerEnv{serverBaseURI, serverCron}
                   UserFeature{..} UserDetailsFeature{..}
-                  UploadFeature{uploadersGroup} signupResetState templates
+                  UploadFeature{uploadersGroup} signupResetBackend templates
   = UserSignupFeature {..}
 
   where
+    signupResetStore = Store.backendStore signupResetBackend
+
     userSignupFeatureInterface = (emptyHackageFeature "user-signup-reset") {
         featureDesc      = "Extra information about user accounts, email addresses etc."
       , featureResources = [signupRequestsResource,
@@ -321,7 +139,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
                             signupRequestResource,
                             resetRequestsResource,
                             resetRequestResource]
-      , featureState     = [abstractAcidStateComponent signupResetState]
+      , featureState     = Store.backendState signupResetBackend
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupExpireCronJob
@@ -340,7 +158,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
 
     captchaResource =
       (resourceAt "/users/register/captcha") {
-        resourceDesc = [ (GET,  "Get a new captcha") ]
+        resourceDesc = [ (GET,  "Acid.Get a new captcha") ]
       , resourceGet  = [ ("json", handlerGetCaptcha) ]
       }
 
@@ -373,31 +191,29 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
     --
 
     queryAllSignupResetInfo :: MonadIO m => m [SignupResetInfo]
-    queryAllSignupResetInfo =
-          queryState signupResetState GetSignupResetTable
-      >>= \(SignupResetTable tbl) -> return (Map.elems tbl)
+    queryAllSignupResetInfo = Store.getSignupResetInfos signupResetStore
 
     querySignupInfo :: Nonce -> MonadIO m => m (Maybe SignupResetInfo)
     querySignupInfo nonce =
-        justSignupInfo <$> queryState signupResetState (LookupSignupResetInfo nonce)
+        justSignupInfo <$> Store.lookupSignupResetInfo signupResetStore nonce
       where
         justSignupInfo (Just info@SignupInfo{}) = Just info
         justSignupInfo _                        = Nothing
 
     queryResetInfo :: Nonce -> MonadIO m => m (Maybe SignupResetInfo)
     queryResetInfo nonce =
-        justResetInfo <$> queryState signupResetState (LookupSignupResetInfo nonce)
+        justResetInfo <$> Store.lookupSignupResetInfo signupResetStore nonce
       where
         justResetInfo (Just info@ResetInfo{}) = Just info
         justResetInfo _                       = Nothing
 
     updateAddSignupResetInfo :: Nonce -> SignupResetInfo -> MonadIO m => m Bool
     updateAddSignupResetInfo nonce signupInfo =
-        updateState signupResetState (AddSignupResetInfo nonce signupInfo)
+        Store.addSignupResetInfo signupResetStore nonce signupInfo
 
     updateDeleteSignupResetInfo :: Nonce -> MonadIO m => m ()
     updateDeleteSignupResetInfo nonce =
-        updateState signupResetState (DeleteSignupResetInfo nonce)
+        Store.deleteSignupResetInfo signupResetStore nonce
 
     -- Expiry
     --
@@ -409,7 +225,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
         cronJobAction    = do
           now <- getCurrentTime
           let expire = now { utctDay = addDays (-7) (utctDay now) }
-          updateState signupResetState (DeleteAllExpired expire)
+          Store.deleteExpiredResetInfos signupResetStore expire
       }
 
     -- Request handlers

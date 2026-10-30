@@ -1,95 +1,31 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE RankNTypes #-}
-module Distribution.Server.Features.Vouch (VouchFeature(..), VouchData(..), VouchError(..), VouchSuccess(..), initVouchFeature, judgeVouch) where
 
+module Distribution.Server.Features.Vouch (VouchFeature(..), initVouchFeature, judgeVouch) where
+
+import Distribution.Server.Features.Vouch.Acid (acidStore)
+import qualified Distribution.Server.Features.Vouch.Store as Store
+import Distribution.Server.Features.Vouch.Types
 import Control.Monad (when, join)
 import Control.Monad.Except (runExceptT, throwError)
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, put)
 import Control.Monad.IO.Class (MonadIO)
 import qualified Data.ByteString.Lazy.Char8 as LBS
-import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
-import Data.Maybe (fromMaybe)
 import Data.Time (UTCTime(..), addUTCTime, getCurrentTime, nominalDay, secondsToDiffTime)
 import Data.Time.Format.ISO8601 (formatShow, iso8601Format)
 import Text.XHtml.Strict (prettyHtmlFragment, stringToHtml, li)
 
-import Data.SafeCopy (base, deriveSafeCopy)
-import Distribution.Server.Framework ((</>), AcidState, DynamicPath, HackageFeature, IsHackageFeature, IsHackageFeature(..), MemSize(..), memSize2)
-import Distribution.Server.Framework (MessageSpan(MText), Method(..), Query, Response, ServerEnv(..), ServerPartE, StateComponent(..), Update)
-import Distribution.Server.Framework (abstractAcidStateComponent, emptyHackageFeature, errBadRequest)
+import Distribution.Server.Framework ((</>), DynamicPath, HackageFeature, IsHackageFeature, IsHackageFeature(..))
+import Distribution.Server.Framework (MessageSpan(MText), Method(..), Response, ServerEnv(..), ServerPartE)
+import Distribution.Server.Framework (emptyHackageFeature, errBadRequest)
 import Distribution.Server.Framework (featureDesc, featureReloadFiles, featureResources, featureState)
-import Distribution.Server.Framework (liftIO, makeAcidic, openLocalStateFrom, query, queryState, resourceAt, resourceDesc, resourceGet)
-import Distribution.Server.Framework (resourcePost, toResponse, update, updateState)
-import Distribution.Server.Framework.BackupRestore (RestoreBackup(..))
+import Distribution.Server.Framework (liftIO, resourceAt, resourceDesc, resourceGet)
+import Distribution.Server.Framework (resourcePost, toResponse)
 import Distribution.Server.Framework.Templating (($=), TemplateAttr, getTemplate, loadTemplates, reloadTemplates, templateUnescaped)
 import qualified Distribution.Server.Users.Group as Group
 import Distribution.Server.Users.Types (UserId(..), UserInfo, UserName(..), userName)
 import Distribution.Server.Features.Upload(UploadFeature(..))
 import Distribution.Server.Features.Users (UserFeature(..))
 import Distribution.Simple.Utils (toUTF8LBS)
-
-data VouchData =
-  VouchData
-    { vouches :: Map.Map UserId [(UserId, UTCTime)]
-    , notNotified :: Set.Set UserId
-    }
-  deriving (Show, Eq)
-
-instance MemSize VouchData where
-  memSize (VouchData vouches notified) = memSize2 vouches notified
-
-putVouch :: UserId -> (UserId, UTCTime) -> Update VouchData ()
-putVouch vouchee (voucher, now) = do
-  VouchData tbl notNotified <- get
-  let oldMap = fromMaybe [] (Map.lookup vouchee tbl)
-      newMap = (voucher, now) : oldMap
-  put $ VouchData (Map.insert vouchee newMap tbl) notNotified
-
-getVouchesFor :: UserId -> Query VouchData [(UserId, UTCTime)]
-getVouchesFor needle = do
-  VouchData tbl _notNotified <- ask
-  pure . fromMaybe [] $ Map.lookup needle tbl
-
-getVouchesData :: Query VouchData VouchData
-getVouchesData = ask
-
-replaceVouchesData :: VouchData -> Update VouchData ()
-replaceVouchesData = put
-
-$(deriveSafeCopy 0 'base ''VouchData)
-
-makeAcidic ''VouchData
-  [ 'putVouch
-  , 'getVouchesFor
-  -- Stock
-  , 'getVouchesData
-  , 'replaceVouchesData
-  ]
-
-vouchStateComponent :: FilePath -> IO (StateComponent AcidState VouchData)
-vouchStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "Vouch") (VouchData mempty mempty)
-  let initialVouchData = VouchData mempty mempty
-      restore =
-        RestoreBackup
-          { restoreEntry = error "Unexpected backup entry"
-          , restoreFinalize = return initialVouchData
-          }
-  pure StateComponent
-    { stateDesc = "Keeps track of vouches"
-    , stateHandle = st
-    , getState = query st GetVouchesData
-    , putState = update st . ReplaceVouchesData
-    , backupState = \_ _ -> []
-    , restoreState = restore
-    , resetState = vouchStateComponent
-    }
 
 data VouchFeature =
   VouchFeature
@@ -106,17 +42,6 @@ requiredCountOfVouches = 2
 isWithinLastMonth :: UTCTime -> (UserId, UTCTime) -> Bool
 isWithinLastMonth now (_, vouchTime) =
   addUTCTime (30 * nominalDay) vouchTime >= now
-
-data VouchError
-  = NotAnUploader
-  | You'reTooNew
-  | VoucheeAlreadyUploader
-  | AlreadySufficientlyVouched
-  | YouAlreadyVouched
-  deriving stock (Show, Eq)
-
-data VouchSuccess = AddVouchComplete | AddVouchIncomplete Int
-  deriving stock (Show, Eq)
 
 judgeVouch
   :: Group.UserIdSet
@@ -167,17 +92,18 @@ renderVouchers lookupUserInfo (uid, timestamp) = do
 
 initVouchFeature :: ServerEnv -> IO (UserFeature -> UploadFeature -> IO VouchFeature)
 initVouchFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMode} = do
-  vouchState <- vouchStateComponent serverStateDir
+  vouchBackend <- acidStore serverStateDir
   templates <- loadTemplates serverTemplatesMode [ serverTemplatesDir, serverTemplatesDir </> "Html"]
                                                  ["vouch.html"]
   vouchTemplate <- getTemplate templates "vouch.html"
   return $ \UserFeature{userNameInPath, lookupUserName, lookupUserInfo, guardAuthenticated}
             UploadFeature{uploadersGroup} -> do
     let
+      vouchStore = Store.backendStore vouchBackend
       handleGetVouches :: DynamicPath -> ServerPartE Response
       handleGetVouches dpath = do
         uid <- lookupUserName =<< userNameInPath dpath
-        vouches <- queryState vouchState $ GetVouchesFor uid
+        vouches <- Store.getVouchesFor vouchStore uid
         param <- renderToLBS lookupUserInfo vouches
         pure . toResponse $ vouchTemplate
           [ "msg" $= ""
@@ -190,8 +116,8 @@ initVouchFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMo
         ugroup <- liftIO $ Group.queryUserGroup uploadersGroup
         now <- liftIO getCurrentTime
         vouchee <- lookupUserName =<< userNameInPath dpath
-        vouchersForVoucher <- queryState vouchState $ GetVouchesFor voucher
-        existingVouchers <- queryState vouchState $ GetVouchesFor vouchee
+        vouchersForVoucher <- Store.getVouchesFor vouchStore voucher
+        existingVouchers <- Store.getVouchesFor vouchStore vouchee
         case judgeVouch ugroup now vouchee vouchersForVoucher existingVouchers voucher of
           Left NotAnUploader ->
             errBadRequest "Not an uploader" [MText "You must be an uploader yourself to endorse other users."]
@@ -204,21 +130,18 @@ initVouchFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMo
           Left YouAlreadyVouched ->
             errBadRequest "Already endorsed" [MText "You have already endorsed this user."]
           Right result -> do
-            updateState vouchState $ PutVouch vouchee (voucher, now)
+            Store.addVouch vouchStore vouchee (voucher, now)
             param <- renderToLBS lookupUserInfo $ existingVouchers ++ [(voucher, now)]
             case result of
               AddVouchComplete -> do
                 -- enqueue vouching completed notification
                 -- which will be read using drainQueuedNotifications
-                VouchData vouches notNotified <-
-                  queryState vouchState GetVouchesData
-                let newState = VouchData vouches (Set.insert vouchee notNotified)
-                updateState vouchState $ ReplaceVouchesData newState
+                Store.queueVouchCompleteNotification vouchStore vouchee
 
                 liftIO $ Group.addUserToGroup uploadersGroup vouchee
                 pure . toResponse $ vouchTemplate
                   [ "msg" $= "Added endorsement. User is now an uploader!"
-                  , "requiredNumber" $= show requiredCountOfVouches                  
+                  , "requiredNumber" $= show requiredCountOfVouches
                   , param
                   ]
               AddVouchIncomplete stillRequired ->
@@ -243,13 +166,8 @@ initVouchFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMo
               , resourcePost = [("html", handlePostVouch)]
               }
             ]
-          , featureState = [ abstractAcidStateComponent vouchState ]
+          , featureState = Store.backendState vouchBackend
           , featureReloadFiles = reloadTemplates templates
           },
-      drainQueuedNotifications = do
-        VouchData vouches notNotified <-
-          queryState vouchState GetVouchesData
-        let newState = VouchData vouches mempty
-        updateState vouchState $ ReplaceVouchesData newState
-        pure $ Set.toList notNotified
+      drainQueuedNotifications = Store.drainQueuedNotifications vouchStore
     }

@@ -52,7 +52,14 @@ withServerRunning root f
                            info "Finished with server")
 
 serverRunningArgs :: [String]
-serverRunningArgs = ["run", "--ip", "127.0.0.1", "--port", show testPort, "--delay-cache-updates", "0"]
+serverRunningArgs =
+  ["run", "--ip", "127.0.0.1"
+  , "--port", show testPort
+  , "--delay-cache-updates", "0"
+  , "--base-uri", "http://127.0.0.1:" <> show testPort
+  , "--user-content-uri", "http://localhost:" <> show testPort
+  , "--required-base-host-header", "127.0.0.1:" <> show testPort
+  ]
 
 waitForServer :: IO ()
 waitForServer = f 10
@@ -261,8 +268,14 @@ testPort = 8392
 mkUrl :: RelativeURL -> AbsoluteURL
 mkUrl relPath = "http://127.0.0.1:" ++ show testPort ++ relPath
 
+mkUserContentUrl :: RelativeURL -> AbsoluteURL
+mkUserContentUrl relPath = "http://localhost:" ++ show testPort ++ relPath
+
 mkGetReq :: RelativeURL -> Request_String
 mkGetReq url = getRequest (mkUrl url)
+
+mkGetUserContentReq :: RelativeURL -> Request_String
+mkGetUserContentReq url = getRequest (mkUserContentUrl url)
 
 mkPostReq :: RelativeURL -> [(String, String)] -> Request_String
 mkPostReq url vals =
@@ -295,12 +308,24 @@ putRequest urlString =
 getUrl :: Authorization -> RelativeURL -> IO String
 getUrl auth url = Http.execRequest auth (mkGetReq url)
 
+getUserContentUrl :: Authorization -> RelativeURL -> IO String
+getUserContentUrl auth url = Http.execRequest auth (mkGetUserContentReq url)
+
 getETag :: RelativeURL -> IO String
 getETag url = Http.responseHeader HdrETag (mkGetReq url)
+
+getETagUserContent :: RelativeURL -> IO String
+getETagUserContent url = Http.responseHeader HdrETag (mkGetUserContentReq url)
 
 mkGetReqWithETag :: String -> RelativeURL -> Request_String
 mkGetReqWithETag url etag =
     Request (fromJust $ parseURI $ mkUrl url) GET hdrs ""
+  where
+    hdrs = [mkHeader HdrIfNoneMatch etag]
+
+mkGetUserContentReqWithETag :: String -> RelativeURL -> Request_String
+mkGetUserContentReqWithETag url etag =
+    Request (fromJust $ parseURI $ mkUserContentUrl url) GET hdrs ""
   where
     hdrs = [mkHeader HdrIfNoneMatch etag]
 
@@ -313,16 +338,27 @@ validateETagHandling url = void $ do
     checkETag etag = void $ Http.execRequest' NoAuth (mkGetReqWithETag url etag) isNotModified
     checkETagMismatch etag = void $ Http.execRequest NoAuth (mkGetReqWithETag url etag)
 
+validateETagHandlingUserContent :: RelativeURL -> IO ()
+validateETagHandlingUserContent url = void $ do
+    etag <- getETagUserContent url
+    checkETag etag
+    checkETagMismatch (etag ++ "garbled123")
+  where
+    checkETag etag = void $ Http.execRequest' NoAuth (mkGetUserContentReqWithETag url etag) isNotModified
+    checkETagMismatch etag = void $ Http.execRequest NoAuth (mkGetUserContentReqWithETag url etag)
+
 getJSONStrings :: RelativeURL -> IO [String]
 getJSONStrings url = getUrl NoAuth url >>= decodeJSON
 
 checkIsForbidden :: Authorization -> RelativeURL -> IO ()
-checkIsForbidden auth url = void $
-  Http.execRequest' auth (mkGetReq url) isForbidden
+checkIsForbidden = checkIsExpectedCode isForbidden
 
 checkIsUnauthorized :: Authorization -> RelativeURL -> IO ()
-checkIsUnauthorized auth url = void $
-  Http.execRequest' auth (mkGetReq url) isUnauthorized
+checkIsUnauthorized = checkIsExpectedCode isUnauthorized
+
+checkIsExpectedCode :: ExpectedCode -> Authorization -> RelativeURL -> IO ()
+checkIsExpectedCode expectedCode auth url = void $
+  Http.execRequest' auth (mkGetReq url) expectedCode
 
 delete :: ExpectedCode -> Authorization -> RelativeURL -> IO ()
 delete expectedCode auth url = void $

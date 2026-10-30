@@ -15,7 +15,7 @@ import Distribution.Server.Framework.Logging
 
 import Distribution.Server.Features.StaticFiles (initStaticFilesFeature)
 import Distribution.Server.Features.Users    (initUserFeature, UserFeature)
-import Distribution.Server.Features.Core     (initCoreFeature, coreResource, queryGetPackageIndex)
+import Distribution.Server.Features.Core     (initCoreFeature, coreResource, queryAllPackageIds)
 import Distribution.Server.Features.Security (initSecurityFeature)
 import Distribution.Server.Features.Upload   (initUploadFeature)
 import Distribution.Server.Features.Mirror   (initMirrorFeature)
@@ -42,7 +42,6 @@ import Distribution.Server.Features.PackageList         (initListFeature)
 import Distribution.Server.Features.HaskellPlatform     (initPlatformFeature)
 import Distribution.Server.Features.UserDetails         (initUserDetailsFeature)
 import Distribution.Server.Features.UserSignup          (initUserSignupFeature)
-import Distribution.Server.Features.LegacyPasswds       (initLegacyPasswdsFeature)
 import Distribution.Server.Features.EditCabalFiles      (initEditCabalFilesFeature)
 import Distribution.Server.Features.AdminFrontend       (initAdminFrontendFeature)
 import Distribution.Server.Features.AdminLog            (initAdminLogFeature)
@@ -112,8 +111,6 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
                               initUserDetailsFeature env
     mkUserSignupFeature    <- logStartup "user signup" $
                               initUserSignupFeature env
-    mkLegacyPasswdsFeature <- logStartup "legacy passwords" $
-                              initLegacyPasswdsFeature env
     mkDistroFeature        <- logStartup "distro" $
                               initDistroFeature env
     mkPackageCandidatesFeature       <- logStartup "package candidates" $
@@ -130,7 +127,7 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
                                initDownloadFeature env
     mkTagsFeature           <- logStartup "tags" $
                                initTagsFeature env
-    mkAnalyticsPixelsFeature <- logStartup "analytics pixels" $ 
+    mkAnalyticsPixelsFeature <- logStartup "analytics pixels" $
                                initAnalyticsPixelsFeature env
     mkVersionsFeature       <- logStartup "versions" $
                                initVersionsFeature env
@@ -213,9 +210,6 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
                            userDetailsFeature
                            uploadFeature
 
-    legacyPasswdsFeature <- mkLegacyPasswdsFeature
-                              usersFeature
-
     distroFeature   <- mkDistroFeature
                          usersFeature
                          coreFeature
@@ -249,7 +243,7 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
 
     documentationCoreFeature <- mkDocumentationCoreFeature
                          (coreResource coreFeature)
-                         (map packageId . allPackages <$> queryGetPackageIndex coreFeature)
+                         (queryAllPackageIds coreFeature)
                          uploadFeature
                          tarIndexCacheFeature
                          reportsCoreFeature
@@ -320,7 +314,7 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
                          reportsCoreFeature
                          userDetailsFeature
                          recentPackagesFeature
-                         
+
 
     editCabalFeature <- mkEditCabalFilesFeature
                           usersFeature
@@ -331,7 +325,6 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
                               usersFeature
                               userDetailsFeature
                               userSignupFeature
-                              legacyPasswdsFeature
 
     hoogleDataFeature <- mkHoogleDataFeature
                            coreFeature
@@ -379,6 +372,7 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
     packageInfoJSONFeature <- mkPackageJSONFeature
                                 coreFeature
                                 versionsFeature
+                                usersFeature
 
 #endif
 
@@ -397,7 +391,6 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
          , getFeatureInterface recentPackagesFeature
          , getFeatureInterface userDetailsFeature
          , getFeatureInterface userSignupFeature
-         , getFeatureInterface legacyPasswdsFeature
          , getFeatureInterface distroFeature
          , getFeatureInterface candidatesFeature
          , getFeatureInterface reportsCoreFeature
@@ -458,9 +451,12 @@ featureCheckpoint = mapM_ abstractStateCheckpoint . featureState
 checkpointAllFeatures :: [HackageFeature] -> IO ()
 checkpointAllFeatures = mapM_ featureCheckpoint
 
--- | Cleanly shut down a feature's state components.
+-- | Cleanly shut down a feature: run its pre-shutdown hook, then close its
+-- state components.
 featureShutdown :: HackageFeature -> IO ()
-featureShutdown = mapM_ abstractStateClose . featureState
+featureShutdown feature = do
+  featurePreShutdown feature
+  mapM_ abstractStateClose (featureState feature)
 
 -- | Cleanly shut down all features' state components.
 shutdownAllFeatures :: [HackageFeature] -> IO ()

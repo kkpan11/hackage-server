@@ -11,8 +11,8 @@ module Distribution.Server.Features.PackageCandidates (
 import Distribution.Server.Framework
 
 import Distribution.Server.Features.PackageCandidates.Types
-import Distribution.Server.Features.PackageCandidates.State
-import Distribution.Server.Features.PackageCandidates.Backup
+import qualified Distribution.Server.Features.PackageCandidates.Acid as Acid
+import qualified Distribution.Server.Features.PackageCandidates.Store as Store
 
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Upload
@@ -24,7 +24,6 @@ import Distribution.Server.Packages.Render
 import Distribution.Server.Packages.ChangeLog
 import Distribution.Server.Packages.Readme
 import qualified Distribution.Server.Users.Types as Users
-import qualified Distribution.Server.Users.Users as Users
 import qualified Distribution.Server.Users.Group as Group
 import qualified Distribution.Server.Framework.BlobStorage as BlobStorage
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
@@ -32,18 +31,18 @@ import Distribution.Server.Packages.PackageIndex (PackageIndex)
 import qualified Distribution.Server.Framework.ResponseContentTypes as Resource
 import Distribution.Server.Features.Security.Migration
 
+import Distribution.Server.Util.Parse (unpackUTF8)
 import Distribution.Server.Util.ServeTarball
 import Distribution.Server.Util.Markdown (renderMarkdown, supposedToBeMarkdown)
-import Distribution.Server.Pages.Template (hackagePage)
+import Distribution.Server.Pages.Template (hackagePageWithHead, syntaxHighlightingHead)
 
 import Distribution.Text
 import Distribution.Package
 import Distribution.Version
 
+import Data.Maybe (maybeToList)
+import qualified Data.ByteString.Lazy     as BS (toStrict, fromStrict)
 import qualified Data.Text                as T
-import qualified Data.Text.Encoding       as T
-import qualified Data.Text.Encoding.Error as T
-import qualified Data.ByteString.Lazy     as BS (ByteString, toStrict)
 import qualified Text.XHtml.Strict        as XHtml
 import           Text.XHtml.Strict        ((<<), (!))
 import           Data.Aeson               (Value (..), object, toJSON, (.=))
@@ -52,6 +51,7 @@ import           Data.Function            (fix)
 import           Data.List                (find, intersperse)
 import           Data.Time.Clock          (getCurrentTime)
 import qualified Data.Vector               as Vec
+import qualified Data.Map                  as Map
 
 
 data PackageCandidatesFeature = PackageCandidatesFeature {
@@ -126,7 +126,7 @@ data PackageCandidatesResource = PackageCandidatesResource {
 data CandidateRender = CandidateRender {
     candPackageRender :: PackageRender,
     renderWarnings :: [String],
-    hasIndexedPackage :: Bool
+    indexedVersions :: [Version]
 }
 
 
@@ -138,51 +138,42 @@ initPackageCandidatesFeature :: ServerEnv
                                  -> TarIndexCacheFeature
                                  -> IO PackageCandidatesFeature)
 initPackageCandidatesFeature env@ServerEnv{serverStateDir} = do
-    candidatesState <- candidatesStateComponent False serverStateDir
+    candidatesBackend <- Acid.acidStore serverStateDir
+    let candidatesStore = Store.backendStore candidatesBackend
 
-    return $ \user core upload tarIndexCache -> do
+    return $ \user core upload@UploadFeature{..} tarIndexCache -> do
       -- one-off migration
-      CandidatePackages{candidateMigratedPkgTarball = migratedPkgTarball} <-
-        queryState candidatesState GetCandidatePackages
+      migratedPkgTarball <- Store.candidateTarballIsMigrated candidatesStore
       unless migratedPkgTarball $ do
-        migrateCandidatePkgTarball_v1_to_v2 env candidatesState
-        updateState candidatesState SetMigratedPkgTarball
+        candidateIndex <- PackageIndex.fromList <$> Store.allCandidates candidatesStore
+        migrateCandidatePkgTarball_v1_to_v2 env candidateIndex $ \pkgid pkginfo ->
+          void $ Store.updateCandidatePkgInfo candidatesStore pkgid pkginfo
+        Store.setCandidateTarballMigrated candidatesStore
+
+      registerHook packageUploaded $ Store.deleteCandidate candidatesStore
 
       let feature = candidatesFeature env
                                       user core upload tarIndexCache
-                                      candidatesState
+                                      candidatesBackend
       return feature
-
-candidatesStateComponent :: Bool -> FilePath -> IO (StateComponent AcidState CandidatePackages)
-candidatesStateComponent freshDB stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "CandidatePackages")
-                           (initialCandidatePackages freshDB)
-  return StateComponent {
-      stateDesc    = "Candidate packages"
-    , stateHandle  = st
-    , getState     = query st GetCandidatePackages
-    , putState     = update st . ReplaceCandidatePackages
-    , resetState   = candidatesStateComponent True
-    , backupState  = \_ -> backupCandidates
-    , restoreState = restoreCandidates
-  }
 
 candidatesFeature :: ServerEnv
                   -> UserFeature
                   -> CoreFeature
                   -> UploadFeature
                   -> TarIndexCacheFeature
-                  -> StateComponent AcidState CandidatePackages
+                  -> Store.Backend
                   -> PackageCandidatesFeature
 candidatesFeature ServerEnv{serverBlobStore = store}
                   UserFeature{..}
                   CoreFeature{ coreResource=core@CoreResource{packageInPath, packageTarballInPath}
                              , queryGetPackageIndex
+                             , queryLookupPackageName
                              , updateAddPackage
                              }
                   UploadFeature{..}
                   TarIndexCacheFeature{packageTarball, findToplevelFile}
-                  candidatesState
+                  Store.Backend{backendStore = candidatesStore, backendState}
   = PackageCandidatesFeature{..}
   where
     candidatesFeatureInterface = (emptyHackageFeature "candidates") {
@@ -200,11 +191,11 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             , candidateContents
             , candidateChangeLog
             ]
-      , featureState = [abstractAcidStateComponent candidatesState]
+      , featureState = backendState
       }
 
     queryGetCandidateIndex :: MonadIO m => m (PackageIndex CandPkgInfo)
-    queryGetCandidateIndex = return . candidateList =<< queryState candidatesState GetCandidatePackages
+    queryGetCandidateIndex = PackageIndex.fromList <$> Store.allCandidates candidatesStore
 
     candidatesCoreResource = fix $ \r -> CoreResource {
 -- TODO: There is significant overlap between this definition and the one in Core
@@ -278,16 +269,19 @@ candidatesFeature ServerEnv{serverBlobStore = store}
         pkgname <- packageInPath dpath
         pkgs <- lookupCandidateName pkgname
 
-        users  <- queryGetUserDb
-        let lupUserName uid = (uid, fmap Users.userName (Users.lookupUserId uid users))
+        let latestTarballs = [ (p, tarball, time, uploader)
+                             | p <- pkgs
+                             , (tarball, (time, uploader), _) <- maybeToList $ pkgLatestTarball $ candPkgInfo p
+                             ]
+        users  <- queryLookupUserIds [ uploader | (_, _, _, uploader) <- latestTarballs ]
+        let lupUserName uid = (uid, fmap Users.userName (Map.lookup uid users))
 
         let pvs = [ object [ Key.fromString "version"  .= (T.pack . display . packageVersion . candInfoId) p
-                           , Key.fromString "sha256"   .= (blobInfoHashSHA256 . pkgTarballGz . fst) tarball
-                           , Key.fromString "time"     .= (fst . snd) tarball
-                           , Key.fromString "uploader" .= (lupUserName . snd . snd) tarball
+                           , Key.fromString "sha256"   .= (blobInfoHashSHA256 . pkgTarballGz) tarball
+                           , Key.fromString "time"     .= time
+                           , Key.fromString "uploader" .= lupUserName uploader
                            ]
-                  | p <- pkgs
-                  , let tarball = Vec.last . pkgTarballRevisions . candPkgInfo $ p
+                  | (p, tarball, time, uploader) <- latestTarballs
                   ]
 
         return . toResponse . toJSON $ pvs
@@ -311,10 +305,10 @@ candidatesFeature ServerEnv{serverBlobStore = store}
           where
             pn = T.pack . display . pkgName . candInfoId . head $ pkgs
             pvs = [ object [ Key.fromString "version" .= (T.pack . display . packageVersion . candInfoId) p
-                           , Key.fromString "sha256"  .= (blobInfoHashSHA256 . pkgTarballGz . fst) tarball
+                           , Key.fromString "sha256"  .= (blobInfoHashSHA256 . pkgTarballGz) tarball
                            ]
                   | p <- pkgs
-                  , let tarball = Vec.last . pkgTarballRevisions . candPkgInfo $ p
+                  , (tarball, _, _) <- maybeToList $ pkgLatestTarball $ candPkgInfo p
                   ]
 
     postCandidate :: ServerPartE Response
@@ -351,14 +345,14 @@ candidatesFeature ServerEnv{serverBlobStore = store}
     doDeleteCandidate dpath = do
       candidate <- packageInPath dpath >>= lookupCandidateId
       guardAuthorisedAsMaintainerOrTrustee (packageName candidate)
-      void $ updateState candidatesState $ DeleteCandidate (packageId candidate)
+      Store.deleteCandidate candidatesStore (packageId candidate)
       seeOther (packageCandidatesUri candidatesResource "" $ packageName candidate) $ toResponse ()
 
     doDeleteCandidates :: DynamicPath -> ServerPartE Response
     doDeleteCandidates dpath = do
       pkgname <- packageInPath dpath
       guardAuthorisedAsMaintainerOrTrustee pkgname
-      void $ updateState candidatesState $ DeleteCandidates pkgname
+      Store.deleteCandidates candidatesStore pkgname
       seeOther (packageCandidatesUri candidatesResource "" pkgname) $ toResponse ()
 
     serveCandidateTarball :: DynamicPath -> ServerPartE Response
@@ -383,7 +377,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
       pkg <- packageInPath dpath >>= lookupCandidateId
       guard (lookup "cabal" dpath == Just (display $ packageName pkg))
       let (fileRev, (utime, _uid)) = pkgLatestRevision (candPkgInfo pkg)
-          cabalfile = Resource.CabalFile (cabalFileByteString fileRev) utime
+          cabalfile = Resource.CabalFile (BS.fromStrict (cabalFileByteString fileRev)) utime
       return $ toResponse cabalfile
 
     uploadCandidate :: (PackageId -> Bool) -> ServerPartE CandPkgInfo
@@ -396,7 +390,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
         now <- liftIO getCurrentTime
         let (UploadResult pkg pkgStr _) = uresult
             pkgid      = packageId pkg
-            cabalfile  = CabalFileText pkgStr
+            cabalfile  = CabalFileText $ BS.toStrict pkgStr
             uploadinfo = (now, uid)
             candidate = CandPkgInfo {
                 candPkgInfo = PkgInfo {
@@ -407,10 +401,13 @@ candidatesFeature ServerEnv{serverBlobStore = store}
                 candWarnings = uploadWarnings uresult,
                 candPublic = True -- do withDataFn
             }
-        void $ updateState candidatesState $ AddCandidate candidate
-        let group = maintainersGroup (packageName pkgid)
-        liftIO $ Group.addUserToGroup group uid
-        return candidate
+        checkCandidate "Upload failed" uid regularIndex candidate >>= \case
+            Just failed -> throwError failed
+            Nothing -> do
+                Store.addCandidate candidatesStore candidate
+                let group = maintainersGroup (packageName pkgid)
+                liftIO $ Group.addUserToGroup group uid
+                return candidate
 
     -- | Helper function for uploadCandidate.
     processCandidate :: (PackageId -> Bool) -> PackageIndex PkgInfo -> Users.UserId -> UploadResult -> IO (Maybe ErrorResponse)
@@ -453,7 +450,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
           -- run filters
           let pkgInfo = candPkgInfo candidate
               uresult = UploadResult (pkgDesc pkgInfo)
-                                     (cabalFileByteString (pkgLatestCabalFileText pkgInfo))
+                                     (BS.fromStrict (cabalFileByteString (pkgLatestCabalFileText pkgInfo)))
                                      (candWarnings candidate)
           time <- liftIO getCurrentTime
           let uploadInfo = (time, uid)
@@ -468,18 +465,22 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             then do
               -- delete when requested: "moving" the resource
               -- should this be required? (see notes in PackageCandidatesResource)
-              when doDelete $ updateState candidatesState $ DeleteCandidate (packageId candidate)
+              when doDelete $ Store.deleteCandidate candidatesStore (packageId candidate)
               return uresult
             else errForbidden "Upload failed" [MText "Package already exists."]
 
 
     -- | Helper function for publishCandidate that ensures it's safe to insert into the main index.
+    checkPublish :: forall m. MonadIO m => Users.UserId -> PackageIndex PkgInfo -> CandPkgInfo -> m (Maybe ErrorResponse)
+    checkPublish = checkCandidate "Publish failed"
+
+    -- | Helper function that ensures it would be safe to insert a package candidate into the main index.
     --
     -- TODO: share code w/ 'Distribution.Server.Features.Upload.processUpload'
-    checkPublish :: forall m. MonadIO m => Users.UserId -> PackageIndex PkgInfo -> CandPkgInfo -> m (Maybe ErrorResponse)
-    checkPublish uid packages candidate
+    checkCandidate :: forall m. MonadIO m => String -> Users.UserId -> PackageIndex PkgInfo -> CandPkgInfo -> m (Maybe ErrorResponse)
+    checkCandidate errorTitle uid packages candidate
       | Just _ <- find ((== candVersion) . packageVersion) pkgs
-        = return $ Just $ ErrorResponse 403 [] "Publish failed" [MText "Package name and version already exist in the database"]
+        = return $ Just $ ErrorResponse 403 [] errorTitle [MText "Package name and version already exist in the database"]
 
       | packageExists packages candidate = return Nothing
 
@@ -488,7 +489,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
           PackageIndex.Unambiguous (mp:_) -> do
             group <- liftIO $ (Group.queryUserGroup . maintainersGroup . packageName) mp
             if not $ uid `Group.member` group
-              then return $ Just $ ErrorResponse 403 [] "Publish failed" (caseClash [mp])
+              then return $ Just $ ErrorResponse 403 [] errorTitle (caseClash [mp])
               else return Nothing
 
           PackageIndex.Unambiguous [] -> return Nothing -- can this ever occur?
@@ -497,7 +498,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             let matchingPackages = concatMap (take 1) mps
             groups <- mapM (liftIO . Group.queryUserGroup . maintainersGroup . packageName) matchingPackages
             if not . any (uid `Group.member`) $ groups
-              then return $ Just $ ErrorResponse 403 [] "Publish failed" (caseClash matchingPackages)
+              then return $ Just $ ErrorResponse 403 [] errorTitle (caseClash matchingPackages)
               else return Nothing
 
           -- no case-neighbors
@@ -518,20 +519,20 @@ candidatesFeature ServerEnv{serverBlobStore = store}
 
     candidateRender :: CandPkgInfo -> IO CandidateRender
     candidateRender cand = do
-        users  <- queryGetUserDb
-        index  <- queryGetPackageIndex
         let pkg = candPkgInfo cand
+        users  <- queryLookupUserIds (packageRenderUserIds pkg)
+        indexedPkgs <- queryLookupPackageName (packageName cand)
         changeLog <- findToplevelFile pkg isChangeLogFile
                  >>= either (\_ -> return Nothing) (return . Just)
         readme    <- findToplevelFile pkg isReadmeFile
                  >>= either (\_ -> return Nothing) (return . Just)
-        let render = doPackageRender users pkg
+        let render = doPackageRender (`Map.lookup` users) pkg
         return $ CandidateRender {
           candPackageRender = render { rendPkgUri    = rendPkgUri render ++ "/candidate"
                                      , rendChangeLog = changeLog
                                      , rendReadme    = readme},
           renderWarnings    = candWarnings cand,
-          hasIndexedPackage = not . null $ PackageIndex.lookupPackageName index (packageName cand)
+          indexedVersions   = map packageVersion indexedPkgs
         }
 
     ------------------------------------------------------------------------------
@@ -543,8 +544,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
     lookupCandidateName :: PackageName -> ServerPartE [CandPkgInfo]
     lookupCandidateName pkgname = do
       guardValidPackageName core pkgname
-      state <- queryState candidatesState GetCandidatePackages
-      return $ PackageIndex.lookupPackageName (candidateList state) pkgname
+      Store.lookupCandidateName candidatesStore pkgname
 
     -- TODO: Unlike the corresponding function in core, we don't return the
     -- "latest" candidate when Version is empty. Should we?
@@ -552,8 +552,8 @@ candidatesFeature ServerEnv{serverBlobStore = store}
     lookupCandidateId :: PackageId -> ServerPartE CandPkgInfo
     lookupCandidateId pkgid = do
       guard (pkgVersion pkgid /= nullVersion)
-      state <- queryState candidatesState GetCandidatePackages
-      case PackageIndex.lookupPackageId (candidateList state) pkgid of
+      mcand <- Store.lookupCandidateId candidatesStore pkgid
+      case mcand of
         Just pkg -> return pkg
         _ -> errNotFound "Candidate not found" [MText $ "No such candidate version for " ++ display (packageName pkgid)]
 
@@ -589,14 +589,16 @@ candidatesFeature ServerEnv{serverBlobStore = store}
                   =<< liftIO (loadTarEntry tarfile offset)
           cacheControl [Public, maxAgeDays 30] etag
           return $ toResponse $ Resource.XHtml $
-            let title = "Changelog for " ++ display (packageId pkg) in
-            hackagePage title
+            let title = "Changelog for " ++ display (packageId pkg)
+                headExtra = if supposedToBeMarkdown filename then syntaxHighlightingHead else []
+            in
+            hackagePageWithHead headExtra title
               [ XHtml.h2 << title
               , XHtml.thediv ! [XHtml.theclass "embedded-author-content"]
                             << if supposedToBeMarkdown filename
                                  then renderMarkdown filename contents
                                  else XHtml.thediv ! [XHtml.theclass "preformatted"]
-                                                  << unpackUtf8 contents
+                                                  << unpackUTF8 contents
               ]
 
 
@@ -608,12 +610,9 @@ candidatesFeature ServerEnv{serverBlobStore = store}
       case mTarball of
         Left err ->
           errNotFound "Could not serve package contents" [MText err]
-        Right (fp, etag, index) ->
-          tarServeResponse <$> serveTarball (display (packageId pkg) ++ " candidate source tarball")
-                       ["index.html"] (display (packageId pkg)) fp index
-                       [Public, maxAgeMinutes 5] etag Nothing
-
-unpackUtf8 :: BS.ByteString -> String
-unpackUtf8 = T.unpack
-           . T.decodeUtf8With T.lenientDecode
-           . BS.toStrict
+        Right (fp, etag, index) -> do
+          tarServe <-
+            serveTarball (display (packageId pkg) ++ " candidate source tarball")
+                         ["index.html"] (display (packageId pkg)) fp index
+                         [Public, maxAgeMinutes 5] etag Nothing
+          requireUserContent userFeatureServerEnv (tarServeResponse tarServe)

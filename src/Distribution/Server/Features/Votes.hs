@@ -4,14 +4,20 @@
 --
 module Distribution.Server.Features.Votes
   ( VotesFeature(..)
+  , Backend(..)
+  , Store(..)
   , initVotesFeature
+  , initVotesFeatureWith
   ) where
 
-import Distribution.Server.Features.Votes.State
+import Distribution.Server.Features.Votes.Types (Score)
+import Distribution.Server.Features.Votes.Acid (acidStore)
 import qualified Distribution.Server.Features.Votes.Render as Render
+import Distribution.Server.Features.Votes.Store
+  ( Backend(..)
+  , Store(..) )
 
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Users
@@ -51,7 +57,15 @@ initVotesFeature :: ServerEnv
                       -> UserFeature
                       -> IO VotesFeature)
 initVotesFeature env@ServerEnv{serverStateDir} = do
-  dbVotesState      <- votesStateComponent serverStateDir
+  initVotesFeatureWith (acidStore serverStateDir) env
+
+initVotesFeatureWith :: IO Backend
+                     -> ServerEnv
+                     -> IO ( CoreFeature
+                        -> UserFeature
+                        -> IO VotesFeature )
+initVotesFeatureWith openVotesStore env = do
+  dbVotesState      <- openVotesStore
   updateVotes       <- newHook
 
   return $ \coref@CoreFeature{..} userf@UserFeature{..} -> do
@@ -61,34 +75,16 @@ initVotesFeature env@ServerEnv{serverStateDir} = do
 
     return feature
 
--- | Define the backing store (i.e. database component)
-votesStateComponent :: FilePath -> IO (StateComponent AcidState VotesState)
-votesStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "Votes") initialVotesState
-  return StateComponent {
-      stateDesc    = "Backing store for Map PackageName -> Users who voted for it"
-    , stateHandle  = st
-    , getState     = query st GetVotesState
-    , putState     = update st . ReplaceVotesState
-    , resetState   = votesStateComponent
-    , backupState  = \_ _ -> []
-    , restoreState = RestoreBackup {
-                         restoreEntry    = error "Unexpected backup entry"
-                       , restoreFinalize = return $ VotesState Map.empty
-                       }
-   }
-
-
 -- | Default constructor for building this feature.
 votesFeature ::  ServerEnv
-             -> StateComponent AcidState VotesState
+             -> Backend
              -> CoreFeature                    -- To get site package list
              -> UserFeature                    -- To authenticate users
              -> Hook (PackageName, Float) ()
              -> VotesFeature
 
 votesFeature  ServerEnv{..}
-              votesState
+              Backend{backendStore = votesState, backendState}
               CoreFeature { coreResource = CoreResource{..} }
               UserFeature{..}
               votesUpdated
@@ -99,7 +95,7 @@ votesFeature  ServerEnv{..}
         featureResources = [ packagesVotesResource
                            , packageVotesResource
                            ]
-      , featureState     = [abstractAcidStateComponent votesState]
+      , featureState     = backendState
       }
 
 
@@ -128,10 +124,10 @@ votesFeature  ServerEnv{..}
     servePackageVotesGet :: DynamicPath -> ServerPartE Response
     servePackageVotesGet _ = do
       cacheControlWithoutETag [Public, maxAgeMinutes 10]
-      votesMap <- queryState votesState GetAllPackageVoteSets
+      scores <- getAllPackageVoteScores votesState
       ok . toResponse $ objectL
-        [ (display pkgname, toJSON (votesScore pkgMap))
-        | (pkgname, pkgMap) <- Map.toList votesMap ]
+        [ (display pkgname, toJSON score)
+        | (pkgname, score) <- Map.toList scores ]
 
     -- Get the number of votes a package has. If the package
     -- has never been voted for, returns 0.
@@ -160,7 +156,7 @@ votesFeature  ServerEnv{..}
         "2" -> pure 2
         "3" -> pure 3
         _   -> fail "invalid score value received"
-      _ <- updateState votesState (AddVote pkgname uid score)
+      _ <- addVote votesState pkgname uid score
       pkgScore <- pkgNumScore pkgname
       runHook_ votesUpdated (pkgname, pkgScore)
       ok . toResponse $ "Package voted for successfully"
@@ -173,7 +169,7 @@ votesFeature  ServerEnv{..}
       pkgname <- packageInPath dpath
       guardValidPackageName pkgname
 
-      success <- updateState votesState (RemoveVote pkgname uid)
+      success <- removeVote votesState pkgname uid
       pkgScore <- pkgNumScore pkgname
       when success $ runHook_ votesUpdated (pkgname, pkgScore)
 
@@ -186,21 +182,17 @@ votesFeature  ServerEnv{..}
     -- Returns true if a user has previously voted for the
     -- package in question.
     didUserVote :: MonadIO m => PackageName -> UserId -> m Bool
-    didUserVote pkgname uid =
-      queryState votesState (GetPackageUserVoted pkgname uid)
+    didUserVote = getPackageUserVoted votesState
 
     -- Returns the number of votes a package has.
     pkgNumVotes :: MonadIO m => PackageName -> m Int
-    pkgNumVotes pkgname =
-      queryState votesState (GetPackageVoteCount pkgname)
+    pkgNumVotes = getPackageVoteCount votesState
 
     pkgNumScore :: MonadIO m => PackageName -> m Float
-    pkgNumScore pkgname =
-      queryState votesState (GetPackageVoteScore pkgname)
+    pkgNumScore = getPackageVoteScore votesState
 
     pkgUserVote :: MonadIO m => PackageName -> UserId -> m (Maybe Score)
-    pkgUserVote pkgname uid =
-      queryState votesState (GetPackageUserVote pkgname uid)
+    pkgUserVote = getPackageUserVote votesState
 
     -- Renders the HTML for the "Votes:" section on package pages.
     renderVotesHtml :: PackageName -> ServerPartE X.Html

@@ -4,6 +4,7 @@ module Distribution.Server.Features.PreferredVersions (
     VersionsFeature(..),
     VersionsResource(..),
     initVersionsFeature,
+    sumRange,
 
     PreferredInfo(..),
     VersionStatus(..),
@@ -12,19 +13,23 @@ module Distribution.Server.Features.PreferredVersions (
 
     PreferredRender(..),
     preferredStateComponent,
+
+    maybeBestVersion,
   ) where
 
 import Distribution.Server.Framework
 
+import qualified Distribution.Server.Features.PreferredVersions.Acid as Acid
+import Distribution.Server.Features.PreferredVersions.Acid (preferredStateComponent)
+import qualified Distribution.Server.Features.PreferredVersions.Store as Store
 import Distribution.Server.Features.PreferredVersions.State
-import Distribution.Server.Features.PreferredVersions.Backup
+import Distribution.Server.Features.PreferredVersions.Types
 
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Upload
 import Distribution.Server.Features.Users
 import Distribution.Server.Features.Tags
 
-import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import Distribution.Server.Packages.Types
 
 import Distribution.Package
@@ -42,6 +47,8 @@ import qualified Data.Aeson.Key             as Key
 import qualified Data.Aeson.KeyMap          as KeyMap
 import qualified Data.ByteString.Lazy.Char8 as BS (pack) -- Only used for ASCII data
 import qualified Data.Map                   as Map
+import Data.Set (Set)
+import qualified Data.Set                   as Set
 import qualified Data.Text                  as Text
 import qualified Data.Vector                as Vector
 
@@ -50,7 +57,7 @@ data VersionsFeature = VersionsFeature {
 
     queryGetPreferredInfo :: forall m. MonadIO m => PackageName -> m PreferredInfo,
     queryGetDeprecatedFor :: forall m. MonadIO m => PackageName -> m (Maybe [PackageName]),
-    queryGetPreferredVersions :: forall m. MonadIO m => m PreferredVersions,
+    queryAllPreferredInfo :: forall m. MonadIO m => m (Map.Map PackageName PreferredInfo),
 
     versionsResource :: VersionsResource,
     deprecatedHook :: Hook (PackageName, Maybe [PackageName]) (),
@@ -100,7 +107,7 @@ initVersionsFeature :: ServerEnv
                         -> UserFeature
                         -> IO VersionsFeature)
 initVersionsFeature env@ServerEnv{serverStateDir} = do
-    preferredState <- preferredStateComponent False serverStateDir
+    preferredBackend <- Acid.acidStore serverStateDir
     deprecatedHook <- newHook
     updatePreferredHook <- newHook
 
@@ -108,30 +115,16 @@ initVersionsFeature env@ServerEnv{serverStateDir} = do
 
       let feature = versionsFeature env
                                     core upload tags user
-                                    preferredState deprecatedHook
+                                    preferredBackend deprecatedHook
                                     updatePreferredHook
       return feature
-
-preferredStateComponent :: Bool -> FilePath -> IO (StateComponent AcidState PreferredVersions)
-preferredStateComponent freshDB stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "PreferredVersions")
-                           (initialPreferredVersions freshDB)
-  return StateComponent {
-      stateDesc    = "Preferred package versions"
-    , stateHandle  = st
-    , getState     = query st GetPreferredVersions
-    , putState     = update st . ReplacePreferredVersions
-    , resetState   = preferredStateComponent True
-    , backupState  = \_ -> backupPreferredVersions
-    , restoreState = restorePreferredVersions
-    }
 
 versionsFeature :: ServerEnv
                 -> CoreFeature
                 -> UploadFeature
                 -> TagsFeature
                 -> UserFeature
-                -> StateComponent AcidState PreferredVersions
+                -> Store.Backend
                 -> Hook (PackageName, Maybe [PackageName]) ()
                 -> Hook (PackageName, PreferredInfo) ()
                 -> VersionsFeature
@@ -140,7 +133,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
                 UploadFeature{..}
                 TagsFeature{..}
                 UserFeature{ guardAuthorised_ }
-                preferredState
+                Store.Backend{backendStore = preferredStore, backendState}
                 deprecatedHook
                 updatePreferredHook
   = VersionsFeature{..}
@@ -156,20 +149,20 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
             ]
       , featurePostInit = do updateDeprecatedTags
                              ephemeralPrefsMigration
-      , featureState    = [abstractAcidStateComponent preferredState]
+      , featureState    = backendState
       }
 
     queryGetPreferredInfo :: MonadIO m => PackageName -> m PreferredInfo
-    queryGetPreferredInfo name = queryState preferredState (GetPreferredInfo name)
+    queryGetPreferredInfo = Store.getPreferredInfo preferredStore
 
     queryGetDeprecatedFor :: MonadIO m => PackageName -> m (Maybe [PackageName])
-    queryGetDeprecatedFor name = queryState preferredState (GetDeprecatedFor name)
+    queryGetDeprecatedFor = Store.getDeprecatedFor preferredStore
 
-    queryGetPreferredVersions :: MonadIO m => m PreferredVersions
-    queryGetPreferredVersions = queryState preferredState GetPreferredVersions
+    queryAllPreferredInfo :: MonadIO m => m (Map.Map PackageName PreferredInfo)
+    queryAllPreferredInfo = Store.getAllPreferredInfo preferredStore
 
     updateDeprecatedTags = do
-      pkgs <- deprecatedMap <$> queryState preferredState GetPreferredVersions
+      pkgs <- Store.getAllDeprecated preferredStore
       setCalculatedTag (Tag "deprecated") (Map.keysSet pkgs)
 
     CoreResource{..} = coreResource
@@ -213,14 +206,13 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
               $ map packageVersion pkgs
         versionType NormalVersion = "normal-version"
         versionType DeprecatedVersion = "deprecated-version"
-        versionType UnpreferredVersion = "unpreferred-version"
       return . toResponse . object
         $ map (\(i, vs) -> (versionType i, array $ map (string . display) vs))
           $ Map.toList classifiedVersions
 
     handlePackagesDeprecatedGet :: DynamicPath -> ServerPartE Response
     handlePackagesDeprecatedGet _ = do
-      deprPkgs <- deprecatedMap <$> queryState preferredState GetPreferredVersions
+      deprPkgs <- Store.getAllDeprecated preferredStore
       return $ toResponse $ array
           [ object
               [ ("deprecated-package", string $ display deprPkg)
@@ -233,7 +225,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     handlePackageDeprecatedGet dpath = do
       pkgname <- packageInPath dpath
       guardValidPackageName pkgname
-      mdep <- queryState preferredState (GetDeprecatedFor pkgname)
+      mdep <- Store.getDeprecatedFor preferredStore pkgname
       return $ toResponse $
         object
             [ ("is-deprecated", Bool (isJust mdep))
@@ -272,15 +264,15 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
 
     updatePackageDeprecation :: MonadIO m => PackageName -> Maybe [PackageName] -> m ()
     updatePackageDeprecation pkgname deprs = liftIO $ do
-      updateState preferredState $ SetDeprecatedFor pkgname deprs
+      Store.setDeprecatedFor preferredStore pkgname deprs
       runHook_ deprecatedHook (pkgname, deprs)
       updateDeprecatedTags
 
     withPackageVersion :: PackageId -> (PkgInfo -> ServerPartE a) -> ServerPartE a
     withPackageVersion pkgid func = do
-        pkgIndex <- queryGetPackageIndex
         guard (packageVersion pkgid /= nullVersion)
-        case PackageIndex.lookupPackageName pkgIndex (packageName pkgid) of
+        pkgs <- queryLookupPackageName (packageName pkgid)
+        case pkgs of
             []   ->  packageError [MText $ "No such package in package index. ", MLink "Search for related terms instead?"$ "/packages/search?terms=" ++ (display $ pkgName pkgid)]
             pkg -> case find ((== packageVersion pkgid) . packageVersion) pkg of
                 Nothing  -> packageError [MText $ "No such package version for " ++ display (packageName pkgid)]
@@ -293,10 +285,10 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     -- which is outside of the scope of this feature.
     withPackagePreferred :: PackageId -> (PkgInfo -> [PkgInfo] -> ServerPartE a) -> ServerPartE a
     withPackagePreferred pkgid func = do
-      pkgIndex <- queryGetPackageIndex
-      case PackageIndex.lookupPackageName pkgIndex (packageName pkgid) of
+      allPkgs <- queryLookupPackageName (packageName pkgid)
+      case allPkgs of
             []   ->  packageError [MText "No such package in package index. ", MLink "Search for related terms instead?" $ "/packages/search?terms=" ++ (display $ pkgName pkgid)]
-            pkgs  | pkgVersion pkgid == nullVersion -> queryState preferredState (GetPreferredInfo $ packageName pkgid) >>= \info -> do
+            pkgs  | pkgVersion pkgid == nullVersion -> Store.getPreferredInfo preferredStore (packageName pkgid) >>= \info -> do
                 let rangeToCheck = sumRange info
                 case maybe id (\r -> filter (flip withinRange r . packageVersion)) rangeToCheck pkgs of
                     -- no preferred version available, choose latest from list ordered by version
@@ -319,7 +311,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
       guardAuthorisedAsMaintainerOrTrustee pkgname
       (prefs, deprs) <- lookPrefRangeDeprecatedVersions pkgs
 
-      prefinfo <- updateState preferredState (SetPreferredInfo pkgname prefs deprs)
+      prefinfo <- Store.setPreferredInfo preferredStore pkgname prefs deprs
       runHook_ updatePreferredHook (pkgname, prefinfo { deprecatedVersions = deprs }) -- It seems they are not set
       updateIndexPackagePreferredVersions pkgname prefinfo
       where
@@ -353,13 +345,14 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     putDeprecated pkgname = do
       guardValidPackageName pkgname
       guardAuthorisedAsMaintainerOrTrustee pkgname
-      index  <- queryGetPackageIndex
       isDepr <- optional $ look "deprecated"
       case isDepr of
           Just {} -> do
               depr <- optional $ fmap words $ look "by"
               case mapM simpleParse =<< depr of
-                  Just deprs -> case filter (null . PackageIndex.lookupPackageName index) deprs of
+                  Just deprs -> do
+                    existing <- queryLookupPackageNames deprs
+                    case filter (`Map.notMember` existing) deprs of
                       [] -> case pkgname `elem` deprs of
                               True -> deprecatedError "You can not deprecate a package in favor of itself!"
                               _ -> do
@@ -373,39 +366,39 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
       where
         deprecatedError = errBadRequest "Deprecation failed" . return . MText
         doUpdates deprs = do
-            void $ updateState preferredState $ SetDeprecatedFor pkgname deprs
+            Store.setDeprecatedFor preferredStore pkgname deprs
             runHook_ deprecatedHook (pkgname, deprs)
             liftIO updateDeprecatedTags
 
     renderPrefInfo :: PreferredInfo -> PreferredRender
     renderPrefInfo pref = PreferredRender {
         rendSumRange = maybe "-any" display $ sumRange pref,
-        rendRanges   = map display $ preferredRanges pref,
+        rendRanges   = [],
         rendVersions = deprecatedVersions pref
     }
 
     doPreferredRender :: PackageName -> ServerPartE PreferredRender
     doPreferredRender pkgname = do
       guardValidPackageName pkgname
-      pref <- queryState preferredState $ GetPreferredInfo pkgname
+      pref <- Store.getPreferredInfo preferredStore pkgname
       return $ renderPrefInfo pref
 
     doDeprecatedRender :: PackageName -> ServerPartE (Maybe [PackageName])
     doDeprecatedRender pkgname = do
       guardValidPackageName pkgname
-      queryState preferredState $ GetDeprecatedFor pkgname
+      Store.getDeprecatedFor preferredStore pkgname
 
     doPreferredsRender :: MonadIO m => m [(PackageName, PreferredRender)]
-    doPreferredsRender = queryState preferredState GetPreferredVersions >>=
-        return . map (second renderPrefInfo) . Map.toList . preferredMap
+    doPreferredsRender = Store.getAllPreferredInfo preferredStore >>=
+        return . map (second renderPrefInfo) . Map.toList
 
     doDeprecatedsRender :: MonadIO m => m [(PackageName, [PackageName])]
-    doDeprecatedsRender = queryState preferredState GetPreferredVersions >>=
-        return . Map.toList . deprecatedMap
+    doDeprecatedsRender = Store.getAllDeprecated preferredStore >>=
+        return . Map.toList
 
     makeGlobalPreferredVersions :: (Functor m, MonadIO m) => m String
     makeGlobalPreferredVersions = do
-      prefs <- preferredMap <$> queryState preferredState GetPreferredVersions
+      prefs <- Store.getAllPreferredInfo preferredStore
       return $! formatGlobalPreferredVersions (Map.toList prefs)
 
     formatSinglePreferredVersions :: PackageName -> PreferredInfo -> Maybe String
@@ -431,14 +424,14 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
 
     -- One-off complex migration
     ephemeralPrefsMigration = do
-      PreferredVersions {migratedEphemeralPrefs, preferredMap}
-        <- queryState preferredState GetPreferredVersions
+      migratedEphemeralPrefs <- Store.isMigratedEphemeralPrefs preferredStore
       unless migratedEphemeralPrefs $
         logTiming verbosity "preferred-versions migration" $ do
+          preferredMap <- Store.getAllPreferredInfo preferredStore
           sequence_
             [ updateIndexPackagePreferredVersions pkgname prefinfo
             | (pkgname, prefinfo) <- Map.toList preferredMap ]
-          updateState preferredState SetMigratedEphemeralPrefs
+          Store.setMigratedEphemeralPrefs preferredStore
 
 {------------------------------------------------------------------------------
   Some aeson auxiliary functions
@@ -452,3 +445,89 @@ object = Object . KeyMap.fromList . map (first Key.fromString)
 
 string :: String -> Value
 string = String . Text.pack
+
+---------------
+
+getVersionStatus :: PreferredInfo -> Version -> VersionStatus
+getVersionStatus info version
+    | version `elem` deprecatedVersions info = DeprecatedVersion
+    | otherwise = NormalVersion
+
+classifyVersions :: PreferredInfo -> [Version] -> [(Version, VersionStatus)]
+classifyVersions (PreferredInfo [] [] _) = map (flip (,) NormalVersion)
+classifyVersions info = map ((,) `ap` getVersionStatus info)
+
+maybeBestVersion :: PreferredInfo -> [Version] -> Set Version -> Maybe (Version, Maybe VersionStatus)
+maybeBestVersion info allVersions versions = if null allVersions || Set.null versions then Nothing else Just $ findBestVersion info allVersions versions
+
+{-
+findBestVersion attempts to find the best version to display out of a set
+of versions. The quality of a given version is encoded in a pair (VersionStatus,
+Bool). If the version is a NormalVersion, then the boolean indicates whether if
+it the most recently uploaded preferred version (and all higher versions are
+either deprecated or unpreferred). Otherwise, if it  is a DeprecatedVersion,
+the boolean indicates that it is the maximum of all uploaded versions.
+
+The list of available versions is scanned from the back (most recent) to the
+front (first one uploaded). If a 'better' version is found than the current
+best version, it is replaced. If no better version can be found, the algorithm
+finishes up. The exact ordering is defined as:
+
+1. (NormalVersion, True) means the latest preferred version of the package is
+available. This option may appear anywhere, although it is always seen before
+(NormalVersion, False). In this case, the algorithm finishes up.
+
+2. (NormalVersion, False) means neither the actual latest version nor the
+preferred latest version are available, but there is some preferred version
+that's available. It can only be scanned after (NormalVersion, True) so the
+algorithm finishes up in this case.
+
+3. (DeprecatedVersion, True) and (DeprecatedVersion, False) mean only a
+deprecated version is available. This is not so great.
+
+This is a bit complex but I think it has the most intuitive result, and is
+rather efficient in 99% of cases.
+
+The version set and version list should both be non-empty; otherwise this
+function is partial. Use maybeBestVersion for a safe check.
+
+-}
+findBestVersion :: PreferredInfo -> [Version] -> Set Version -> (Version, Maybe VersionStatus)
+findBestVersion info allVersions versions =
+    let topStatus = getVersionStatus info maxVersion
+    in if maxAllVersion == maxVersion && topStatus == NormalVersion
+        then (maxVersion, Just NormalVersion) -- most common case
+        else second classifyOpt $ newSearch (reverse $ Set.toList versions) (maxVersion, (topStatus, True))
+  where
+    maxVersion = Set.findMax versions
+    maxAllVersion = last allVersions
+
+    newestPreferred = case filter ((==NormalVersion) . (infoMap Map.!)) allVersions of
+        []    -> Nothing
+        prefs -> Just $ last prefs
+
+    infoMap = Map.fromDistinctAscList $ classifyVersions info allVersions
+
+    newSearch (v:vs) _ = case infoMap Map.! v of
+        NormalVersion | v == maxAllVersion -> (v, (NormalVersion, True))
+        NormalVersion -> oldSearch vs (v, (NormalVersion, False))
+        DeprecatedVersion -> newSearch vs (v, (DeprecatedVersion, True))
+    newSearch [] opt = opt
+
+    oldSearch (v:vs) opt = case infoMap Map.! v of
+        NormalVersion -> replaceBetter opt (v, (NormalVersion, newestPreferred == Just v))
+        other -> oldSearch vs $ replaceBetter opt (v, (other, False))
+    oldSearch [] opt = opt
+
+    replaceBetter keep@(_, old) replace@(_, new) = if optionPrefs new > optionPrefs old then replace else keep
+
+    optionPrefs :: (VersionStatus, Bool) -> Int
+    optionPrefs opt = case opt of
+        (NormalVersion, True) -> 4
+        (NormalVersion, False) -> 2
+        _ -> 0
+
+    classifyOpt opt = case opt of
+        (NormalVersion, True) -> Just NormalVersion
+        (DeprecatedVersion, _) -> Just DeprecatedVersion
+        _ -> Nothing

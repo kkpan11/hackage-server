@@ -9,7 +9,6 @@ import qualified Control.Monad.Trans.State as State
 import qualified Data.Array as Arr
 import qualified Data.Bimap as Bimap
 import qualified Data.ByteString.Lazy as Lazy (ByteString)
-import qualified Data.ByteString.Lazy as ByteStringL
 import           Data.Foldable (for_)
 import           Data.Functor.Identity (Identity(..))
 import           Data.List (partition, foldl')
@@ -24,24 +23,16 @@ import           Network.URI (parseURI)
 import           System.Random (mkStdGen)
 
 import Distribution.Package (PackageIdentifier(..), mkPackageName, packageId, packageName)
-import Distribution.Server.Features.PreferredVersions.State (PreferredVersions(..), VersionStatus(NormalVersion), PreferredInfo(..))
+import Distribution.Server.Features.PreferredVersions.State (PreferredInfo(..))
+import Distribution.Server.Features.PreferredVersions.Types (VersionStatus(NormalVersion))
 import Distribution.Server.Features.ReverseDependencies (ReverseFeature(..), ReverseCount(..), reverseFeature)
 import Distribution.Server.Features.ReverseDependencies.State (ReverseIndex(..), addPackage, constructReverseIndex, emptyReverseIndex, getDependenciesFlat, getDependencies, getDependenciesFlatRaw, getDependenciesRaw)
 import Distribution.Server.Features.Tags (Tag(..))
-import Distribution.Server.Features.UserDetails (AccountDetails(..), UserDetailsFeature(..))
+import Distribution.Server.Features.UserDetails (UserDetailsFeature(..))
+import Distribution.Server.Features.UserDetails.Types (AccountDetails(..))
 import Distribution.Server.Features.UserNotify
-  ( Notification(..)
-  , NotifyMaintainerUpdateType(..)
-  , NotifyData(..)
-  , NotifyPref(..)
-  , NotifyRevisionRange(..)
-  , NotifyTriggerBounds(..)
-  , defaultNotifyPrefs
-  , getNotificationEmails
-  , getUserNotificationsOnRelease
-  , importNotifyPref
-  , notifyDataToCSV
-  )
+import Distribution.Server.Features.UserNotify.Acid
+import Distribution.Server.Features.UserNotify.Types
 import Distribution.Server.Framework.BackupRestore (runRestore)
 import Distribution.Server.Framework.Hook (newHook)
 import Distribution.Server.Framework.MemState (newMemStateWHNF)
@@ -132,19 +123,13 @@ mkRevFeat :: [PkgInfo] -> IO ReverseFeature
 mkRevFeat pkgs = do
   let
     idx = PackageIndex.fromList pkgs
-    preferredVersions =
-      PreferredVersions
-        { preferredMap = mempty
-        , deprecatedMap = mempty
-        , migratedEphemeralPrefs = False
-        }
   updateReverse <- newHook
   let constructed = constructReverseIndex idx
   memState <- newMemStateWHNF constructed
   pure $
     reverseFeature
     (pure idx)
-    (pure preferredVersions)
+    (pure mempty)
     memState
     updateReverse
 
@@ -256,9 +241,9 @@ allTests = testGroup "ReverseDependenciesTest"
           base4_15 = PackageIdentifier "base" (mkVersion [4,15])
           base4_16 = PackageIdentifier "base" (mkVersion [4,16])
           runWithPref preferences index pkg = runIdentity $
-            getUserNotificationsOnRelease userSetIdForPackage index (constructReverseIndex index) preferences pkg
+            getUserNotificationsOnRelease userSetIdForPackage (PackageIndex.lookupPackageName index) (constructReverseIndex index) preferences pkg
           runWithPrefAlsoMtl2 preferences index pkg = runIdentity $
-            getUserNotificationsOnRelease userSet index (constructReverseIndex index) preferences pkg
+            getUserNotificationsOnRelease userSet (PackageIndex.lookupPackageName index) (constructReverseIndex index) preferences pkg
               where
               userSet arg | arg == mkPackageName "mtl" = Identity (UserIdSet.fromList [UserId 0])
                           | arg == mkPackageName "mtl2" = Identity (UserIdSet.fromList [UserId 0])
@@ -315,6 +300,29 @@ allTests = testGroup "ReverseDependenciesTest"
                 \    build-depends: base >= 4.15 && < 4.16"
             ])
           base4_15)
+      assertEqual
+        "getUserNotificationsOnRelease(trigger=BoundsOutOfRange) should judge each reverse dependency by its own latest version"
+        (Map.singleton (UserId 0) [PackageIdentifier (mkPackageName "mtl2") (mkVersion [2,0])])
+        (runWithPrefAlsoMtl2
+          (pref BoundsOutOfRange)
+          (PackageIndex.fromList
+            [ mkPackage "base" [4,14] []
+            , mkPackage "base" [4,15] []
+            , mkPackage "mtl" [2,2] ["base < 4.15"]
+            , mkPackage "mtl" [2,3] ["base < 5"]
+            , mkPackage "mtl2" [2,0] ["base < 4.15"]
+            ])
+          base4_15)
+      assertEqual
+        "getUserNotificationsOnRelease shouldn't generate a notification when the new package can't be found"
+        mempty
+        (runIdentity $
+          getUserNotificationsOnRelease
+            userSetIdForPackage
+            (const [])
+            (constructReverseIndex (PackageIndex.fromList newBaseReleased))
+            (pref BoundsOutOfRange)
+            base4_15)
   , getNotificationEmailsTests
   , testCase "hedgehogTests" $ do
       res <- hedgehogTests
@@ -392,7 +400,6 @@ getNotificationEmailsTests =
           . getNotificationEmail
               testServerEnv
               testUserDetailsFeature
-              allUsers
               userWatcher
           $ NotifyDependencyUpdate
               { notifyPackageId = PackageIdentifier "base" (mkVersion [4, 18, 0, 0])
@@ -404,7 +411,6 @@ getNotificationEmailsTests =
           . getNotificationEmail
               testServerEnv
               testUserDetailsFeature
-              allUsers
               userWatcher
           $ NotifyDependencyUpdate
               { notifyPackageId = PackageIdentifier "base" (mkVersion [4, 18, 0, 0])
@@ -416,7 +422,6 @@ getNotificationEmailsTests =
           . getNotificationEmail
               testServerEnv
               testUserDetailsFeature
-              allUsers
               userWatcher
           $ NotifyDependencyUpdate
               { notifyPackageId = PackageIdentifier "base" (mkVersion [4, 18, 0, 0])
@@ -483,8 +488,8 @@ getNotificationEmailsTests =
           <*> addUser "user-actor"
           <*> addUser "user-subject"
 
-    getNotificationEmail env details users uid notif =
-      getNotificationEmails env details users (mockTemplates ["datafiles/templates/UserNotify"] ["endorsements-complete.txt"]) [(uid, notif)] >>= \case
+    getNotificationEmail env details uid notif =
+      getNotificationEmails env details (mentionedUserNames [(uid, notif)]) (mockTemplates ["datafiles/templates/UserNotify"] ["endorsements-complete.txt"]) [(uid, notif)] >>= \case
         [email] -> pure email
         _ -> error "Did not get exactly one email"
 
@@ -505,17 +510,25 @@ getNotificationEmailsTests =
                   , accountAdminNotes = ""
                   }
         }
-    getNotificationEmailsMocked =
+    getNotificationEmailsMocked notifs =
       getNotificationEmails
         testServerEnv
         testUserDetailsFeature
-        allUsers
+        (mentionedUserNames notifs)
         (mockTemplates ["datafiles/templates/UserNotify"] ["endorsements-complete.txt"])
+        notifs
     getNotificationEmailMocked =
       getNotificationEmail
         testServerEnv
         testUserDetailsFeature
-        allUsers
+    -- Resolves only the users that notificationUserIds lists, as the
+    -- notification job does.
+    mentionedUserNames notifs =
+      Users.userIdToNameIn . Map.fromList $
+        [ (uid, uinfo)
+        | uid <- concatMap notificationUserIds notifs
+        , Just uinfo <- [Users.lookupUserId uid allUsers]
+        ]
 
     renderMail = fst . Mail.renderMail (mkStdGen 0)
     timestamp = Time.UTCTime (Time.fromGregorian 2020 1 1) 0
@@ -551,7 +564,7 @@ getNotificationEmailsTests =
     genPackageName = mkPackageName <$> Gen.string (Range.linear 1 30) Gen.unicode
     genVersion = mkVersion <$> Gen.list (Range.linear 1 4) (Gen.int $ Range.linear 0 50)
     genPackageId = PackageIdentifier <$> genPackageName <*> genVersion
-    genCabalFileText = CabalFileText . ByteStringL.fromStrict <$> Gen.utf8 (Range.linear 0 50000) Gen.unicode
+    genCabalFileText = CabalFileText <$> Gen.utf8 (Range.linear 0 50000) Gen.unicode
     genNonExistentUserId = UserId <$> Gen.int (Range.linear (-1000) (-1))
     genUploadInfo = (,) <$> genUTCTime <*> genNonExistentUserId
     genTag = Tag <$> Gen.string (Range.linear 1 10) Gen.unicode

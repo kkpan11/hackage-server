@@ -2,10 +2,17 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 -- | Download counts
 --
 -- We maintain
+--
+-- 0. In-memory (cache): downloads that have arrived since the last flush.
+--    Downloads are accumulated here and flushed into (1) as a single
+--    transaction once per flush interval, so that a busy server does not write
+--    one acid-state event per download. A hard crash loses at most one flush
+--    interval worth of counts.
 --
 -- 1. In-memory (ACID): today's download counts per package version
 --
@@ -33,6 +40,8 @@ import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Features.DownloadCount.State
 import Distribution.Server.Features.DownloadCount.Backup
+import Distribution.Server.Features.DownloadCount.Acid (acidStore)
+import qualified Distribution.Server.Features.DownloadCount.Store as Store
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Users
 
@@ -41,8 +50,11 @@ import Distribution.Server.Util.CountingMap (cmFromCSV, cmToList)
 
 import Data.Time.Calendar (Day, addDays)
 import Data.Time.Clock (getCurrentTime, utctDay)
-import Control.Concurrent.Chan
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, swapTVar)
+import Control.Exception (SomeException, try)
+import qualified Data.Map.Strict as Map
 import GHC.Generics (Generic)
 import Data.Aeson (ToJSON)
 import qualified Data.Aeson as Aeson
@@ -74,34 +86,23 @@ data PackageDownloads = PackageDownloads {
 initDownloadFeature :: ServerEnv
                     -> IO (CoreFeature -> UserFeature -> IO DownloadFeature)
 initDownloadFeature serverEnv@ServerEnv{serverStateDir} = do
-    inMemState     <- inMemStateComponent  serverStateDir
+    inMemBackend   <- acidStore serverStateDir
     let onDiskState = onDiskStateComponent serverStateDir
     (recentDownloads,
      totalDownloads) <- computeRecentAndTotalDownloads =<< getState onDiskState
     recentCache    <- newMemStateWHNF recentDownloads
     totalsCache    <- newMemStateWHNF totalDownloads
-    downChan       <- newChan
+    pendingDownloads <- newTVarIO Map.empty
+    flushLock        <- newMVar ()
 
     return $ \core users -> do
-      let feature = downloadFeature core users serverEnv inMemState
-                      onDiskState totalsCache recentCache downChan
+      let feature = downloadFeature core users serverEnv inMemBackend
+                      onDiskState totalsCache recentCache
+                      pendingDownloads flushLock
 
-      registerHook (packageDownloadHook core) (writeChan downChan)
+      registerHook (packageDownloadHook core) $ \pkgid ->
+        atomically $ modifyTVar' pendingDownloads (Map.insertWith (+) pkgid 1)
       return feature
-
-inMemStateComponent :: FilePath -> IO (StateComponent AcidState InMemStats)
-inMemStateComponent stateDir = do
-  initSt <- initInMemStats <$> getToday
-  st <- openLocalStateFrom (dcPath stateDir </> "inmem") initSt
-  return StateComponent {
-      stateDesc    = "Today's download counts"
-    , stateHandle  = st
-    , getState     = query st GetInMemStats
-    , putState     = update st . ReplaceInMemStats
-    , backupState  = \_ -> inMemBackup
-    , restoreState = inMemRestore
-    , resetState   = inMemStateComponent
-    }
 
 onDiskStateComponent :: FilePath -> StateComponent OnDiskState OnDiskStats
 onDiskStateComponent stateDir = StateComponent {
@@ -121,31 +122,35 @@ onDiskStateComponent stateDir = StateComponent {
 downloadFeature :: CoreFeature
                 -> UserFeature
                 -> ServerEnv
-                -> StateComponent AcidState   InMemStats
+                -> Store.Backend
                 -> StateComponent OnDiskState OnDiskStats
                 -> MemState TotalDownloads
                 -> MemState RecentDownloads
-                -> Chan PackageId
+                -> TVar (Map.Map PackageId Int)
+                -> MVar ()
                 -> DownloadFeature
 
 downloadFeature CoreFeature{}
                 UserFeature{..}
-                ServerEnv{serverStateDir}
-                inMemState
+                ServerEnv{serverStateDir, serverVerbosity, serverFlushDownloadsPeriod}
+                inMemBackend
                 onDiskState
                 totalDownloadsCache
                 recentDownloadsCache
-                downloadStream
+                pendingDownloads
+                flushLock
   = DownloadFeature{..}
   where
+    inMemStore = Store.backendStore inMemBackend
+
     downloadFeatureInterface = (emptyHackageFeature "download") {
         featureResources = [ topDownloads downloadResource
                            , downloadCSV
                            ]
-      , featurePostInit  = void $ forkIO registerDownloads
-      , featureState     = [ abstractAcidStateComponent   inMemState
-                           , abstractOnDiskStateComponent onDiskState
-                           ]
+      , featureRunHook   = void $ forkIO (flushDownloadsLoop serverFlushDownloadsPeriod)
+      , featureState     = Store.backendState inMemBackend
+                        ++ [abstractOnDiskStateComponent onDiskState]
+      , featurePreShutdown = shutdownFlush
       , featureCaches    = [
             CacheComponent {
               cacheDesc       = "recent package downloads cache",
@@ -164,34 +169,68 @@ downloadFeature CoreFeature{}
     totalPackageDownloads :: MonadIO m => m TotalDownloads
     totalPackageDownloads = readMemState totalDownloadsCache
 
-    registerDownloads = forever $ do
-        pkg    <- readChan downloadStream
-        today  <- getToday
-        today' <- query (stateHandle inMemState) RecordedToday
+    flushDownloadsLoop :: Int -> IO ()
+    flushDownloadsLoop flushInterval = forever $ do
+        threadDelay flushInterval
+        flushDownloadsSafe
 
-        --TODO: do this asyncronously rather than blocking this request
+    logErrors :: String -> IO () -> IO ()
+    logErrors what action = do
+        outcome <- try action
+        case outcome of
+          Right () -> return ()
+          Left err -> lognotice serverVerbosity $
+            what ++ ": " ++ show (err :: SomeException)
+
+    flushDownloadsSafe :: IO ()
+    flushDownloadsSafe =
+        logErrors "Error recording download counts" flushDownloads
+
+    shutdownFlush :: IO ()
+    shutdownFlush = do
+        flushDownloadsSafe
+        logErrors "Error checkpointing download counts" $
+          Store.checkpointInMemStats inMemStore
+
+    flushDownloads :: IO ()
+    flushDownloads = withMVar flushLock $ \() -> do
+        checkDayRollover
+
+        counts <- atomically $ swapTVar pendingDownloads Map.empty
+        unless (Map.null counts) $
+          Store.registerDownloads inMemStore (Map.toList counts)
+
+    checkDayRollover :: IO ()
+    checkDayRollover = do
+        today  <- getToday
+        today' <- Store.recordedToday inMemStore
+
+        --TODO: this should be a daily cron job rather than being polled by the
+        -- flush loop: the rollover does a lot of I/O (it rewrites the whole
+        -- on-disk history) and it holds up the flush of the counts while it
+        -- runs.
         when (today /= today') $ do
-          -- For the first download each day we reset the in-memory stats and..
-          inMemStats <- getState inMemState
-          putState inMemState $ initInMemStats today
+          -- For the first flush each day we reset the in-memory stats and..
+          inMemStats <- Store.getInMemStats inMemStore
+          Store.replaceInMemStats inMemStore $ initInMemStats today
           -- we can discard the large eventlog by writing a small checkpoint
-          createCheckpoint (stateHandle inMemState)
+          Store.checkpointInMemStats inMemStore
 
           -- Write yesterday's downloads to the log
           appendToLog (dcPath serverStateDir) inMemStats
 
-          -- Update the on-disk statistics and recompute recent downloads
-          onDiskStats' <- updateHistory inMemStats <$> getState onDiskState
-          writeOnDiskStats (dcPath serverStateDir </> "ondisk") onDiskStats'
-          --TODO: this is still stupid, writing it out only to read it back
-          -- we should be able to update the in memory ones incrementally
+          -- Update the on-disk statistics and recompute recent downloads.
+          -- Only the packages downloaded yesterday need writing out.
+          (onDiskStats',
+           changedPkgs) <- updateHistory inMemStats <$> getState onDiskState
+          writeOnDiskStatsFor (dcPath serverStateDir </> "ondisk")
+                              changedPkgs onDiskStats'
+          --TODO: we still recompute these from the whole history rather than
+          -- updating them with yesterday's downloads
           (recentDownloads,
-           totalDownloads) <- computeRecentAndTotalDownloads =<< getState onDiskState
+           totalDownloads) <- computeRecentAndTotalDownloads onDiskStats'
           writeMemState recentDownloadsCache recentDownloads
           writeMemState totalDownloadsCache totalDownloads
-
-
-        updateState inMemState $ RegisterDownload pkg
 
 
     downloadResource = DownloadResource {

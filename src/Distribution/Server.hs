@@ -1,4 +1,5 @@
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
 module Distribution.Server (
     -- * Server control
     Server(..),
@@ -32,13 +33,13 @@ import qualified Distribution.Server.Framework.Auth as Auth
 import Distribution.Server.Framework.Templating (TemplatesMode(..))
 import Distribution.Server.Framework.AuthTypes (PasswdPlain(..))
 import Distribution.Server.Framework.HtmlFormWrapper (htmlFormWrapperHack)
+import Distribution.Server.Framework.CSRF (csrfMiddleware)
 
 import Distribution.Server.Framework.Feature as Feature
 import qualified Distribution.Server.Features as Features
 import Distribution.Server.Features.Users
 
 import qualified Distribution.Server.Users.Types as Users
-import qualified Distribution.Server.Users.Users as Users
 import qualified Distribution.Server.Users.Group as Group
 
 import Distribution.Text
@@ -75,6 +76,8 @@ data ServerConfig = ServerConfig {
   confStaticDir :: FilePath,
   confTmpDir    :: FilePath,
   confCacheDelay:: Int,
+  -- | Period before which downloads are flushed to disk
+  confDownloadFlush :: Int,
   confLiveTemplates :: Bool
 } deriving (Show)
 
@@ -108,6 +111,7 @@ defaultServerConfig = do
     confStaticDir = dataDir,
     confTmpDir    = "state" </> "tmp",
     confCacheDelay= 0,
+    confDownloadFlush = 60,
     confLiveTemplates = False
   }
 
@@ -128,7 +132,7 @@ hasSavedState = doesDirectoryExist . confDbStateDir
 mkServerEnv :: ServerConfig -> IO ServerEnv
 mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHostHeader _
                                     stateDir _ tmpDir
-                                    cacheDelay liveTemplates) = do
+                                    cacheDelay flushDownloadPeriod liveTemplates) = do
     createDirectoryIfMissing False stateDir
     let blobStoreDir  = confBlobStoreDir   config
         staticDir     = confStaticFilesDir config
@@ -149,7 +153,8 @@ mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHo
             serverBlobStore     = store,
             serverCron          = cron,
             serverTmpDir        = tmpDir,
-            serverCacheDelay    = cacheDelay * 1000000, --microseconds
+            serverCacheDelay    = cacheDelay * 1_000_000, --microseconds
+            serverFlushDownloadsPeriod = flushDownloadPeriod * 1_000_000,--microseconds
             serverBaseURI       = hostURI,
             serverUserContentBaseURI = userContentURI,
             serverRequiredBaseHostHeader = requiredBaseHostHeader,
@@ -196,6 +201,8 @@ run server@Server{ serverEnv = env } = do
       cronJobOneShot   = False,
       cronJobAction    = checkpoint server
     }
+
+    mapM_ Feature.featureRunHook (serverFeatures server)
 
     runServer listenOn $ do
 
@@ -301,10 +308,9 @@ initState server (admin, pass) = do
 impl :: Server -> ServerPart Response
 impl server = logExceptions $
     runServerPartE $
-      handleErrorResponse (serveErrorResponse errHandlers Nothing) $
-        renderServerTree [] serverTree
-          `mplus`
-        fallbackNotFound
+      handleErrorResponse (serveErrorResponse errHandlers Nothing) $ do
+        csrfMiddleware
+        renderServerTree [] serverTree `mplus` fallbackNotFound
   where
     serverTree :: ServerTree (DynamicPath -> ServerPartE Response)
     serverTree =

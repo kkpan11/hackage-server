@@ -25,7 +25,8 @@ module Distribution.Server.Users.Users (
     lookupAuthToken,
 
     -- ** Lookup utils
-    userIdToName,
+    userIdToNameIn,
+    userNameOrPlaceholder,
 
     -- * Enumeration
     enumerateAllUsers,
@@ -50,7 +51,6 @@ import Data.List  (sort, group, foldl')
 import qualified Data.Map as Map
 import qualified Data.IntMap as IntMap
 import Data.SafeCopy (base, deriveSafeCopy, extension, Migrate(..))
-import Data.Typeable (Typeable)
 import Control.Exception (assert)
 import qualified Data.Text as T
 
@@ -68,7 +68,7 @@ data Users = Users {
     -- | A map from 'AuthToken' to 'UserId' for quick token based auth
     authTokenMap :: !(Map.Map AuthToken UserId)
   }
-  deriving (Eq, Typeable, Show)
+  deriving (Eq, Show)
 
 instance MemSize Users where
   memSize (Users a b c d) = memSize4 a b c d
@@ -146,19 +146,6 @@ emptyUsers = Users {
     authTokenMap = Map.empty
   }
 
--- error codes
-data ErrUserNameClash = ErrUserNameClash deriving Typeable
-data ErrUserIdClash   = ErrUserIdClash   deriving Typeable
-data ErrNoSuchUserId  = ErrNoSuchUserId  deriving Typeable
-data ErrDeletedUser   = ErrDeletedUser   deriving Typeable
-data ErrTokenNotOwned = ErrTokenNotOwned deriving Typeable
-
-$(deriveSafeCopy 0 'base ''ErrUserNameClash)
-$(deriveSafeCopy 0 'base ''ErrUserIdClash)
-$(deriveSafeCopy 0 'base ''ErrNoSuchUserId)
-$(deriveSafeCopy 0 'base ''ErrDeletedUser)
-$(deriveSafeCopy 0 'base ''ErrTokenNotOwned)
-
 (?!) :: Maybe a -> e -> Either e a
 ma ?! e = maybe (Left e) Right ma
 
@@ -181,14 +168,19 @@ lookupAuthToken authTok users =
        uinfo <- lookupUserId uid users
        return (uid, uinfo)
 
--- | Convert a 'UserId' to a 'UserName'. If the user id doesn't exist,
--- an ugly placeholder is used instead.
+-- | Convert a 'UserId' to a 'UserName' using users that have already been
+-- looked up. If the user id is missing, an ugly placeholder is used instead.
 --
-userIdToName :: Users -> UserId -> UserName
-userIdToName users userId@(UserId idNum) =
-    case lookupUserId userId users of
-      Just user -> userName user
-      Nothing   -> UserName $ "~id#" ++ show idNum
+userIdToNameIn :: Map.Map UserId UserInfo -> UserId -> UserName
+userIdToNameIn infos userId =
+    userNameOrPlaceholder userId (Map.lookup userId infos)
+
+-- | The name of a looked-up user. If there is no such user, an ugly
+-- placeholder is used instead.
+--
+userNameOrPlaceholder :: UserId -> Maybe UserInfo -> UserName
+userNameOrPlaceholder _ (Just user) = userName user
+userNameOrPlaceholder (UserId idNum) Nothing = UserName $ "~id#" ++ show idNum
 
 
 -- | Add a new user account, in the enabled state.
@@ -377,7 +369,7 @@ data Users_v0 = Users_v0 {
     -- | The next available UserId
     nextId_v0      :: !UserId
   }
-  deriving (Eq, Typeable, Show)
+  deriving (Eq, Show)
 
 $(deriveSafeCopy 0 'base ''Users_v0)
 

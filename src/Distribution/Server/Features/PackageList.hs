@@ -15,11 +15,9 @@ import Distribution.Server.Features.DownloadCount
 import Distribution.Server.Features.Tags
 import Distribution.Server.Features.Users
 import Distribution.Server.Features.Upload(UploadFeature(..))
-import Distribution.Server.Users.Users (userIdToName)
 import qualified Distribution.Server.Users.UserIdSet as UserIdSet
 import Distribution.Server.Users.Group(UserGroup(..), GroupDescription(..))
 import Distribution.Server.Features.PreferredVersions
-import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import Distribution.Server.Util.CountingMap (cmFind)
 
 import Distribution.Server.Packages.Types
@@ -152,8 +150,8 @@ initListFeature _env = do
       registerHookJust packageChangeHook isPackageAdd $ \pkg -> do
         let pkgname = packageName . packageId $ pkg
         prefsinfo <- queryGetPreferredInfo pkgname
-        index <- queryGetPackageIndex
-        let allVersions = packageVersion <$> PackageIndex.lookupPackageName index pkgname
+        pkgs <- queryLookupPackageName pkgname
+        let allVersions = packageVersion <$> pkgs
         modifyItem pkgname $ \x ->
             updateReferenceVersion prefsinfo allVersions $
               x
@@ -165,8 +163,8 @@ initListFeature _env = do
          case fmap (mkPackageName . fst) (groupEntity gd) of
               Just pkgname -> do
                    maintainers <- queryUserGroup (maintainersGroup pkgname)
-                   users' <- queryGetUserDb
-                   modifyItem pkgname (\x -> x {itemMaintainer = map (userIdToName users') (UserIdSet.toList maintainers)})
+                   userIdToName <- queryUserNamesFor (UserIdSet.toList maintainers)
+                   modifyItem pkgname (\x -> x {itemMaintainer = map userIdToName (UserIdSet.toList maintainers)})
                    runHook_ itemUpdate (Set.singleton pkgname)
               Nothing -> return ()
 
@@ -196,8 +194,8 @@ initListFeature _env = do
           runHook_ itemUpdate (Set.singleton pkgname)
 
       registerHook updatePreferredHook $ \(pkgname, prefsinfo) -> do
-          index <- queryGetPackageIndex
-          let allVersions = packageVersion <$> PackageIndex.lookupPackageName index pkgname
+          pkgs <- queryLookupPackageName pkgname
+          let allVersions = packageVersion <$> pkgs
           modifyItem pkgname $ updateReferenceVersion prefsinfo allVersions
 
       return feature
@@ -252,15 +250,13 @@ listFeature CoreFeature{..}
         case hasItem of
             True  -> modifyMemState itemCache $ Map.adjust token pkgname
             False -> do
-                index <- queryGetPackageIndex
-                let pkgs = PackageIndex.lookupPackageName index pkgname
+                pkgs <- queryLookupPackageName pkgname
                 case pkgs of
                     [] -> return () --this shouldn't happen
                     _  -> modifyMemState itemCache . uncurry Map.insert =<< constructItem (last pkgs)
 
     updateDesc pkgname = do
-        index <- queryGetPackageIndex
-        let pkgs = PackageIndex.lookupPackageName index pkgname
+        pkgs <- queryLookupPackageName pkgname
         case pkgs of
            [] -> modifyMemState itemCache (Map.delete pkgname)
            _  -> modifyItem pkgname (updateDescriptionItem $ pkgDesc $ last pkgs)
@@ -276,8 +272,8 @@ listFeature CoreFeature{..}
 
     constructItemIndex :: IO (Map PackageName PackageItem)
     constructItemIndex = do
-        index <- queryGetPackageIndex
-        items <- mapM (constructItem . last) $ PackageIndex.allPackagesByName index
+        latestPackages <- queryLatestPackages
+        items <- mapM constructItem latestPackages
         return $ Map.fromList items
 
     constructItem :: PkgInfo -> IO (PackageName, PackageItem)
@@ -285,17 +281,17 @@ listFeature CoreFeature{..}
         let pkgname = packageName pkg
             desc = pkgDesc pkg
         intRevDirectCount <- revDirectCount pkgname
-        users <- queryGetUserDb
         tags  <- queryTagsForPackage pkgname
         downs <- recentPackageDownloads
         votes <- pkgNumScore pkgname
         deprs <- queryGetDeprecatedFor pkgname
         maintainers <- queryUserGroup (maintainersGroup pkgname)
+        userIdToName <- queryUserNamesFor (UserIdSet.toList maintainers)
         prefsinfo <- queryGetPreferredInfo pkgname
 
         return $ (,) pkgname . updateReferenceVersion prefsinfo [pkgVersion (pkgInfoId pkg)] $ (updateDescriptionItem desc $ emptyPackageItem pkgname) {
             itemTags       = tags
-          , itemMaintainer = map (userIdToName users) (UserIdSet.toList maintainers)
+          , itemMaintainer = map userIdToName (UserIdSet.toList maintainers)
           , itemDeprecated = deprs
           , itemDownloads  = cmFind pkgname downs
           , itemVotes      = votes

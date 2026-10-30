@@ -3,6 +3,8 @@
 
 module Distribution.Server.Features.Votes.State where
 
+import Distribution.Server.Features.Votes.Types
+import Distribution.Server.Features.Votes.Store (votesScore)
 import Distribution.Server.Framework.MemSize
 
 import Distribution.Package (PackageName)
@@ -12,24 +14,19 @@ import qualified Distribution.Server.Users.UserIdSet as UserIdSet
 
 import Distribution.Server.Users.State ()
 
-import Data.Typeable
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.List
 import Data.Maybe (fromMaybe)
-import Control.Arrow ((&&&))
 import Data.Acid     (Query, Update, makeAcidic)
 import Data.SafeCopy (base, extension, deriveSafeCopy, Migrate(..))
 
 import qualified Control.Monad.State as State
 import Control.Monad.Reader.Class (ask)
 
-type Score = Int
-
 newtype VotesState_v0 = VotesState_v0 { votesMap :: Map PackageName UserIdSet }
 
 newtype VotesState = VotesState (Map PackageName (Map UserId Score))
-  deriving (Show, Eq, Typeable, MemSize)
+  deriving (Show, Eq, MemSize)
 
 -- SafeCopy instances
 deriveSafeCopy 0 'base      ''VotesState_v0
@@ -56,16 +53,6 @@ userVotedForPackage pkgname uid votes =
       Just m -> case Map.lookup uid m of
                   Nothing -> False
                   Just _ -> True
-
--- Using a Bayesian average (m=1.5, C=2) to calculate scoring
-votesScore :: Map UserId Score -> Float
-votesScore m =
-     let grouping = map (head &&& length) . group . sort . Map.elems $ m
-         score :: Float
-         score = fromIntegral ((sum $ map (uncurry (*)) grouping) + 3)/
-                 fromIntegral (2 + sum (map snd grouping))
-         roundedScore = fromIntegral (round (score * 4) :: Int) / 4
-     in roundedScore
 
 -- All the acid state transactions
 

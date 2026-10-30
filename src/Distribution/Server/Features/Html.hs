@@ -33,6 +33,7 @@ import Distribution.Server.Features.Distro
 import Distribution.Server.Features.Documentation
 import Distribution.Server.Features.TarIndexCache
 import Distribution.Server.Features.UserDetails
+import Distribution.Server.Features.UserDetails.Types
 import Distribution.Server.Features.EditCabalFiles
 import Distribution.Server.Features.Html.HtmlUtilities
 import Distribution.Server.Features.Security.SHA256
@@ -42,8 +43,6 @@ import Distribution.Server.Users.Types
 import qualified Distribution.Server.Users.Group as Group
 import Distribution.Server.Packages.Types
 import Distribution.Server.Packages.Render
-import qualified Distribution.Server.Users.Users as Users
-import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import Distribution.Server.Users.Group (UserGroup(..))
 
 import qualified Distribution.Server.Pages.Package as Pages
@@ -66,9 +65,8 @@ import Data.List (intercalate, intersperse, insert)
 import Data.Function (on)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.Vector as Vec
 import qualified Data.Text as T
-import qualified Data.ByteString.Lazy.Char8 as BS (ByteString)
+import qualified Data.ByteString.Lazy as BS (LazyByteString, fromStrict)
 import qualified Network.URI as URI
 
 import Text.XHtml.Strict
@@ -434,7 +432,7 @@ mkHtmlCore :: ServerEnv
            -> HtmlCore
 mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
            utilities@HtmlUtilities{..}
-           UserFeature{queryGetUserDb, checkAuthenticated, guardAuthorised_, adminGroup}
+           UserFeature{queryUserNamesFor, checkAuthenticated, guardAuthorised_, adminGroup}
            CoreFeature{coreResource}
            VersionsFeature{ versionsResource
                           , queryGetDeprecatedFor
@@ -545,48 +543,48 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
     serveRecentPage :: DynamicPath -> ServerPartE Response
     serveRecentPage _ = do
       recentPackages <- getRecentPackages
-      users <- queryGetUserDb
       page <-  lookupPage 1
       pageSize <- lookupPageSize 20
 
       let conf = Paging.createConf page pageSize recentPackages
+      userIdToName <- queryUserNamesFor (Pages.recentUserIds conf recentPackages)
 
-      return . toResponse $ Pages.recentPage conf users recentPackages
+      return . toResponse $ Pages.recentPage conf userIdToName recentPackages
 
     serveRecentRSS :: DynamicPath -> ServerPartE Response
     serveRecentRSS _ = do
       recentPackages <- getRecentPackages
-      users <- queryGetUserDb
       page <-  lookupPage 1
       pageSize <- lookupPageSize 20
       now   <- liftIO getCurrentTime
 
       let conf = Paging.createConf page pageSize recentPackages
+      userIdToName <- queryUserNamesFor (Pages.recentUserIds conf recentPackages)
 
-      return . toResponse $ Pages.recentFeed conf users serverBaseURI now recentPackages
+      return . toResponse $ Pages.recentFeed conf userIdToName serverBaseURI now recentPackages
 
     serveRevisionPage :: DynamicPath -> ServerPartE Response
     serveRevisionPage _ = do
       revisions <- getRecentRevisions
-      users <- queryGetUserDb
       page <-  lookupPage 1
       pageSize <- lookupPageSize 40
 
       let conf = Paging.createConf page pageSize revisions
+      userIdToName <- queryUserNamesFor (Pages.revisionsUserIds conf revisions)
 
-      return . toResponse $ Pages.revisionsPage conf users revisions
+      return . toResponse $ Pages.revisionsPage conf userIdToName revisions
 
     serveRevisionRSS :: DynamicPath -> ServerPartE Response
     serveRevisionRSS _ = do
       revisions <- getRecentRevisions
-      users <- queryGetUserDb
       page <-  lookupPage 1
       pageSize <- lookupPageSize 40
       now   <- liftIO getCurrentTime
 
       let conf = Paging.createConf page pageSize revisions
+      userIdToName <- queryUserNamesFor (Pages.revisionsUserIds conf revisions)
 
-      return . toResponse $ Pages.recentRevisionsFeed conf users serverBaseURI now revisions
+      return . toResponse $ Pages.recentRevisionsFeed conf userIdToName serverBaseURI now revisions
 
     serveBrowsePage :: DynamicPath -> ServerPartE Response
     serveBrowsePage _dpath = do
@@ -650,7 +648,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
         pkgVotes      <- pkgNumVotes pkgname
         pkgScore      <- pkgNumScore pkgname
         auth          <- checkAuthenticated
-        userRating    <- case auth of Just (uid,_) -> pkgUserVote pkgname uid; _ -> return Nothing
+        userRating    <- case auth of Just uid -> pkgUserVote pkgname uid; _ -> return Nothing
         mdoctarblob   <- queryDocumentation realpkg
         tags          <- queryTagsForPackage pkgname
         rdeps         <- queryReverseDeps pkgname
@@ -666,13 +664,13 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
         mdocIndex     <- maybe (return Nothing)
           (liftM Just . liftIO . cachedTarIndex) mdoctarblob
         analyticsPixels <- getPackageAnalyticsPixels pkgname
-        userDb          <- queryGetUserDb
         maintainerlist  <- liftIO $ queryUserGroup maintainers
+        maintainerName  <- queryUserNamesFor (Group.toList maintainerlist)
         let
-          idAndReport = fmap (\(rptId, rpt, _) -> (rptId, rpt)) rptStats
+          idAndReport = fmap (\(rptId, rpt, _, _) -> (rptId, rpt)) rptStats
           install = getInstall $ fmap (fst &&& BR.installOutcome . snd) idAndReport
           test    = getTest    $ fmap (        BR.testsOutcome   . snd) idAndReport
-          covg = getAvgCovg $ (\(_, _, cvg) -> cvg) =<< rptStats
+          covg = getAvgCovg $ (\(_, _, cvg, _) -> cvg) =<< rptStats
           loadDocMeta
             | Just doctarblob <- mdoctarblob
             , Just docIndex   <- mdocIndex
@@ -721,7 +719,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
           , "candidates"        $= case candidates of
                                     [] -> [ toHtml "No Candidates"]
                                     _  -> [ PagesNew.commaList $ flip map candidates $ \cand -> anchor ! [href $ corePackageIdUri candidatesCore "" $ packageId cand] << display (packageVersion cand) ]
-          , "maintainers"       $= listGroupCompact (map (Users.userIdToName userDb) (Group.toList maintainerlist))
+          , "maintainers"       $= listGroupCompact (map maintainerName (Group.toList maintainerlist))
           ] ++
           -- Items not related to IO (mostly pure functions)
           PagesNew.packagePageTemplate render
@@ -801,44 +799,45 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
     serveCabalRevisionsPage :: DynamicPath -> ServerPartE Response
     serveCabalRevisionsPage dpath = do
       pkginfo  <- packageInPath dpath >>= lookupPackageId
-      users    <- queryGetUserDb
       let pkgid        = packageId pkginfo
           pkgname      = packageName pkginfo
-          revisions    = reverse $ Vec.toList (pkgMetadataRevisions pkginfo)
+          cabalFiles   = reverse $ pkgAllRevisionsCabalFiles pkginfo
+          uploadInfos  = reverse $ pkgAllRevisionsUploadInfos pkginfo
           numRevisions = pkgNumRevisions pkginfo
 
           revchanges   :: [(SHA256Digest, [Change])]
-          revchanges   = start revisions where
+          revchanges   = start cabalFiles where
             start []          = []
             start (curr:rest) = go curr rest
 
-            go curr [] = [(sha256 (cabalFileByteString (fst curr)), [])]
+            go curr [] = [(sha256 (BS.fromStrict (cabalFileByteString curr)), [])]
             go curr (prev:rest) =
-                ( sha256 (cabalFileByteString (fst curr))
+                ( sha256 (BS.fromStrict (cabalFileByteString curr))
                 , changes curr prev )
                 : go prev rest
 
             changes curr prev = either (const []) id $
               diffCabalRevisionsByteString
-                (cabalFileByteString (fst prev))
-                (cabalFileByteString (fst curr))
+                (cabalFileByteString prev)
+                (cabalFileByteString curr)
 
+      userIdToName <- queryUserNamesFor (map snd uploadInfos)
       cacheControl [NoCache] (etagFromHash numRevisions)
       template <- getTemplate templates "revisions.html"
       return $ toResponse $ template
         [ "pkgname"   $= pkgname
         , "pkgid"     $= pkgid
-        , "revisions" $= zipWith3 (revisionToTemplate users)
-                                  (map snd revisions)
+        , "revisions" $= zipWith3 (revisionToTemplate userIdToName)
+                                  uploadInfos
                                   [numRevisions-1, numRevisions-2..]
                                   revchanges
         ]
       where
-        revisionToTemplate :: Users.Users -> UploadInfo -> Int
+        revisionToTemplate :: (UserId -> UserName) -> UploadInfo -> Int
                            -> (SHA256Digest, [Change])
                            -> TemplateVal
-        revisionToTemplate users (utime, uid) revision (sha256hash, changes) =
-          let uname = Users.userIdToName users uid
+        revisionToTemplate userIdToName (utime, uid) revision (sha256hash, changes) =
+          let uname = userIdToName uid
            in templateDict
                 [ templateVal "number" revision
                 , templateVal "sha256" (show sha256hash)
@@ -849,7 +848,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
 
 
 -- | Common helper used by 'serveCandidatePage' and 'servePackagePage'
-makeReadme :: MonadIO m => PackageRender -> m (Maybe BS.ByteString)
+makeReadme :: MonadIO m => PackageRender -> m (Maybe BS.LazyByteString)
 makeReadme render = case rendReadme render of
   Just (tarfile, _, offset, _) ->
         either (\_err -> return Nothing) (return . Just . snd) =<<
@@ -901,7 +900,7 @@ mkHtmlUsers UserFeature{..} UserDetailsFeature{..} = HtmlUsers{..}
 
     serveUserList :: DynamicPath -> ServerPartE Response
     serveUserList _ = do
-        userlist <- Users.enumerateActiveUsers <$> queryGetUserDb
+        userlist <- queryActiveUsers
         let hlist = unordList
                       [ anchor ! [href $ userPageUri users "" uname] << display uname
                       | (_, uinfo) <- userlist, let uname = userName uinfo ]
@@ -1113,9 +1112,10 @@ mkHtmlReports HtmlUtilities{..} CoreFeature{..} UploadFeature{..} UserFeature{..
 
     servePackageReport :: DynamicPath -> ServerPartE Response
     servePackageReport dpath = do
-        (repid, report, mlog, mtest, covg) <- packageReport dpath
+        (repid, report, mlog, mtest, covg, testReportLog) <- packageReport dpath
         mlog' <- traverse queryBuildLog mlog
         mtest' <- traverse queryTestLog mtest
+        testReportLog' <- traverse queryTestReportLog testReportLog
         let covg' = fmap getCvgDet covg
         pkgid <- packageInPath dpath
         cacheControlWithoutETag [Public, maxAgeDays 30]
@@ -1125,6 +1125,7 @@ mkHtmlReports HtmlUtilities{..} CoreFeature{..} UploadFeature{..} UserFeature{..
           , "report" $= (repid, report)
           , "log" $= toMessage <$> mlog'
           , "test" $= toMessage <$> mtest'
+          , "testReport" $= toMessage <$> testReportLog'
           , "covg" $= covg'
           ]
       where
@@ -1182,7 +1183,7 @@ mkHtmlCandidates ServerEnv{..} utilities@HtmlUtilities{..}
                  DocumentationFeature{documentationResource, queryDocumentation,..}
                  TarIndexCacheFeature{cachedTarIndex}
                  PackageCandidatesFeature{..}
-                 UserFeature{ guardAuthorised, guardAuthorised_, queryGetUserDb }
+                 UserFeature{ guardAuthorised, guardAuthorised_, queryUserNamesFor }
                  templates = HtmlCandidates{..}
   where
     candidates     = candidatesResource
@@ -1322,9 +1323,7 @@ mkHtmlCandidates ServerEnv{..} utilities@HtmlUtilities{..}
       candRender <- liftIO $ candidateRender cand
       let PackageIdentifier pkgname version = packageId cand
           render = candPackageRender candRender
-      otherVersions <- map packageVersion
-                     . flip PackageIndex.lookupPackageName pkgname
-                   <$> queryGetPackageIndex
+          otherVersions = indexedVersions candRender
       prefInfo <- queryGetPreferredInfo pkgname
       let maintainHtml = anchor ! [href $ renderResource maintain [display $ packageId cand]] << "maintain"
       -- bottom sections, currently documentation and readme
@@ -1347,20 +1346,19 @@ mkHtmlCandidates ServerEnv{..} utilities@HtmlUtilities{..}
 
       let docURL = packageDocsContentUri docs (packageId cand)
 
-      -- also utilize hasIndexedPackage :: Bool
       let warningBox = case renderWarnings candRender of
               [] -> []
               warn -> [thediv ! [theclass "candidate-warn"] << [paragraph << strong (toHtml "Warnings:"), unordList warn]]
 
       let maintainers = maintainersGroup pkgname
-      userDb          <- queryGetUserDb
       maintainerlist  <- liftIO $ queryUserGroup maintainers
+      maintainerName  <- queryUserNamesFor (Group.toList maintainerlist)
 
       return $ toResponse . template $
         [ "versions"          $= (PagesNew.renderVersion (packageId cand) (classifyVersions prefInfo $ insert version otherVersions) Nothing)
         , "maintainHtml"      $= [maintainHtml]
         , "warningBox"        $= warningBox
-        , "maintainers"       $= listGroupCompact (map (Users.userIdToName userDb) (Group.toList maintainerlist))
+        , "maintainers"       $= listGroupCompact (map maintainerName (Group.toList maintainerlist))
         ] ++
         PagesNew.packagePageTemplate render
             mdocIndex mdocMeta mreadme
@@ -1783,8 +1781,8 @@ mkHtmlTags HtmlUtilities{..}
 
     serveTagsListing :: DynamicPath -> ServerPartE Response
     serveTagsListing _ = do
-        tagList <- queryGetTagList
-        let withCounts = filter ((>0) . snd) . map (\(tg, pkgs) -> (tg, Set.size pkgs)) $ tagList
+        tagCounts <- queryTagCounts
+        let withCounts = filter ((>0) . snd) tagCounts
             countSort = sortBy (flip compare `on` snd) withCounts
         return $ toResponse $ Resource.XHtml $ hackagePage "Hackage tags"
           [ h2 << "Hackage tags"
@@ -2066,9 +2064,9 @@ htmlGroupResource UserFeature{..} r@(GroupResource groupR userR getGroup) =
   where
     getList dpath = do
         group    <- getGroup dpath
-        userDb   <- queryGetUserDb
         usergroup <- liftIO . queryUserGroup $ group
-        let unames = [ Users.userIdToName userDb uid
+        userIdToName <- queryUserNamesFor (Group.toList usergroup)
+        let unames = [ userIdToName uid
                      | uid   <- Group.toList usergroup ]
         let baseUri = renderResource' groupR dpath
         cacheControl [NoCache] (etagFromHash unames)
@@ -2077,9 +2075,9 @@ htmlGroupResource UserFeature{..} r@(GroupResource groupR userR getGroup) =
     getEditList dpath = do
         group    <- getGroup dpath
         (canAdd, canDelete) <- lookupGroupEditAuth group
-        userDb   <- queryGetUserDb
         usergroup <- liftIO . queryUserGroup $ group
-        let unames = [ Users.userIdToName userDb uid
+        userIdToName <- queryUserNamesFor (Group.toList usergroup)
+        let unames = [ userIdToName uid
                      | uid   <- Group.toList usergroup ]
         let baseUri = renderResource' groupR dpath
         cacheControl [NoCache] (etagFromHash unames)
@@ -2116,7 +2114,7 @@ mkHtmlReverse HtmlUtilities{..}
                         , corePackageIdUri
                         , corePackageNameUri
                         },
-                        queryGetPackageIndex
+                        queryCountPackages
                       }
            VersionsFeature{withPackageVersion}
            ListFeature{}
@@ -2185,6 +2183,6 @@ mkHtmlReverse HtmlUtilities{..}
     serveReverseList :: DynamicPath -> ServerPartE Response
     serveReverseList _ = do
         namesWithCounts <- revCountForAllPackages
-        hackCount <- PackageIndex.indexSize <$> queryGetPackageIndex
+        hackCount <- queryCountPackages
         return $ toResponse $ Resource.XHtml $ hackagePage "Reverse dependencies" $
             reversePackagesRender (corePackageNameUri "") hackCount namesWithCounts

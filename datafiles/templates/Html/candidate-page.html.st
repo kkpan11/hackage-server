@@ -5,6 +5,7 @@
   <link href="$doc.baseUrl$/quick-jump.css" rel="stylesheet" type="text/css" title="QuickJump" />
   $endif$
   $hackageCssTheme()$
+  $syntaxHighlighting$
   <title>
     $package.name$$if(package.optional.hasSynopsis)$: $package.optional.synopsis$$endif$
   </title>
@@ -95,10 +96,12 @@
         $if(package.optional.hasHomePage)$
         <tr>
           <th>Home page</th>
-          <td>
-            <a href=$package.optional.homepage$>
-              $package.optional.homepage$
-            </a>
+          <td class="word-wrap">
+            $if(package.optional.homepageIsSafeURI)$
+            <a href="$package.optional.homepage$">$package.optional.homepage$</a>
+            $else$
+            $package.optional.homepage$
+            $endif$
           </td>
         </tr>
         $endif$
@@ -106,10 +109,12 @@
         $if(package.optional.hasBugTracker)$
         <tr>
           <th>Bug&nbsp;tracker</th>
-          <td>
-            <a href="$package.optional.bugTracker$">
-              $package.optional.bugTracker$
-            </a>
+          <td class="word-wrap">
+            $if(package.optional.bugTrackerIsSafeURI)$
+            <a href="$package.optional.bugTracker$">$package.optional.bugTracker$</a>
+            $else$
+            $package.optional.bugTracker$
+            $endif$
           </td>
         </tr>
         $endif$

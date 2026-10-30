@@ -13,7 +13,7 @@ import qualified Network.URI as URI
 import Data.List (find)
 import Data.Text.Encoding (encodeUtf8)
 import Happstack.Server (ServerMonad(askRq))
-import Happstack.Server.Response (seeOther, toResponse)
+import Happstack.Server.Response (movedPermanently, toResponse)
 import Happstack.Server.Types (HeaderPair(..), Response, rqHeaders, rqQuery, rqUri)
 
 import qualified Hackage.Security.Util.Path as Sec
@@ -73,6 +73,11 @@ data ServerEnv = ServerEnv {
     -- increasing the time taken to update the cache we can push this further.
     serverCacheDelay :: Int,
 
+    -- | A tunable parameter for the download counts in-memory accumulation.
+    -- Download counts are accumulated in-memory and flushed to disk every 'serverFlushDownloadPeriods'
+    -- microseconds.
+    serverFlushDownloadsPeriod :: Int,
+
     serverVerbosity  :: Verbosity
 }
 
@@ -96,6 +101,6 @@ requireUserContent ServerEnv {serverUserContentBaseURI, serverRequiredBaseHostHe
           , URI.uriQuery = rqQuery rq
           }
       in
-       seeOther (show uri) (toResponse ())
+       movedPermanently (show uri) (toResponse ())
      else
        pure action

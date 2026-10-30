@@ -7,15 +7,13 @@ module Distribution.Server.Features.Upload (
   ) where
 
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupDump
 
-import Distribution.Server.Features.Upload.State
-import Distribution.Server.Features.Upload.Backup
+import qualified Distribution.Server.Features.Upload.Acid as UploadAcid
+import qualified Distribution.Server.Features.Upload.Store as UploadStore
 
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Users
 
-import Distribution.Server.Users.Backup
 import Distribution.Server.Packages.Types
 import qualified Distribution.Server.Users.Types as Users
 import qualified Distribution.Server.Users.Group as Group
@@ -29,7 +27,7 @@ import Data.Maybe (fromMaybe)
 import Data.List (dropWhileEnd, intersperse)
 import Data.Time.Clock (getCurrentTime)
 import Data.Function (fix)
-import Data.ByteString.Lazy (ByteString)
+import Data.ByteString.Lazy (LazyByteString, toStrict)
 
 import Distribution.Package
 import Distribution.PackageDescription (GenericPackageDescription)
@@ -48,6 +46,9 @@ data UploadFeature = UploadFeature {
     -- request to get contextual information.
     -- For new pacakges lifecycle, this should be removed
     uploadPackage      :: ServerPartE UploadResult,
+
+    -- | Notification that a new package was uploaded.
+    packageUploaded    :: Hook PackageId (),
 
     --TODO: consider moving the trustee and/or per-package maintainer groups
     --      lower down in the feature hierarchy; many other features want to
@@ -97,7 +98,7 @@ data UploadResult = UploadResult {
     -- The parsed Cabal file.
     uploadDesc :: !GenericPackageDescription,
     -- The text of the Cabal file.
-    uploadCabal :: !ByteString,
+    uploadCabal :: !LazyByteString,
     -- Any warnings from unpacking the tarball.
     uploadWarnings :: ![String]
 }
@@ -106,9 +107,9 @@ initUploadFeature :: ServerEnv
                   -> IO (UserFeature -> CoreFeature -> IO UploadFeature)
 initUploadFeature env@ServerEnv{serverStateDir} = do
     -- Canonical state
-    trusteesState    <- trusteesStateComponent    serverStateDir
-    uploadersState   <- uploadersStateComponent   serverStateDir
-    maintainersState <- maintainersStateComponent serverStateDir
+    uploadBackend <- UploadAcid.acidStore serverStateDir
+
+    packageUploaded  <- newHook
 
     return $ \user@UserFeature{..} core@CoreFeature{..} -> do
 
@@ -119,9 +120,11 @@ initUploadFeature env@ServerEnv{serverStateDir} = do
                trusteesGroupDescription, uploadersGroupDescription,
                maintainersGroupDescription)
                 = uploadFeature env core user
-                                trusteesState    trusteesGroup    trusteesGroupResource
-                                uploadersState   uploadersGroup   uploadersGroupResource
-                                maintainersState maintainersGroup maintainersGroupResource
+                                uploadBackend
+                                trusteesGroup    trusteesGroupResource
+                                uploadersGroup   uploadersGroupResource
+                                maintainersGroup maintainersGroupResource
+                                packageUploaded
 
           (trusteesGroup,  trusteesGroupResource) <-
             groupResourceAt "/packages/trustees"  trusteesGroupDescription
@@ -129,7 +132,7 @@ initUploadFeature env@ServerEnv{serverStateDir} = do
           (uploadersGroup, uploadersGroupResource) <-
             groupResourceAt "/packages/uploaders" uploadersGroupDescription
 
-          pkgNames <- PackageIndex.packageNames <$> queryGetPackageIndex
+          pkgNames <- queryAllPackageNames
           (maintainersGroup, maintainersGroupResource) <-
             groupResourcesAt "/package/:package/maintainers"
                              maintainersGroupDescription
@@ -139,51 +142,14 @@ initUploadFeature env@ServerEnv{serverStateDir} = do
 
       return feature
 
-trusteesStateComponent :: FilePath -> IO (StateComponent AcidState HackageTrustees)
-trusteesStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "HackageTrustees") initialHackageTrustees
-  return StateComponent {
-      stateDesc    = "Trustees"
-    , stateHandle  = st
-    , getState     = query st GetHackageTrustees
-    , putState     = update st . ReplaceHackageTrustees . trusteeList
-    , backupState  = \_ (HackageTrustees trustees) -> [csvToBackup ["trustees.csv"] $ groupToCSV trustees]
-    , restoreState = HackageTrustees <$> groupBackup ["trustees.csv"]
-    , resetState   = trusteesStateComponent
-    }
-
-uploadersStateComponent :: FilePath -> IO (StateComponent AcidState HackageUploaders)
-uploadersStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "HackageUploaders") initialHackageUploaders
-  return StateComponent {
-      stateDesc    = "Uploaders"
-    , stateHandle  = st
-    , getState     = query st GetHackageUploaders
-    , putState     = update st . ReplaceHackageUploaders . uploaderList
-    , backupState  = \_ (HackageUploaders uploaders) -> [csvToBackup ["uploaders.csv"] $ groupToCSV uploaders]
-    , restoreState = HackageUploaders <$> groupBackup ["uploaders.csv"]
-    , resetState   = uploadersStateComponent
-    }
-
-maintainersStateComponent :: FilePath -> IO (StateComponent AcidState PackageMaintainers)
-maintainersStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "PackageMaintainers") initialPackageMaintainers
-  return StateComponent {
-      stateDesc    = "Package maintainers"
-    , stateHandle  = st
-    , getState     = query st AllPackageMaintainers
-    , putState     = update st . ReplacePackageMaintainers
-    , backupState  = \_ (PackageMaintainers mains) -> [maintToExport mains]
-    , restoreState = maintainerBackup
-    , resetState   = maintainersStateComponent
-    }
-
 uploadFeature :: ServerEnv
               -> CoreFeature
               -> UserFeature
-              -> StateComponent AcidState HackageTrustees    -> UserGroup -> GroupResource
-              -> StateComponent AcidState HackageUploaders   -> UserGroup -> GroupResource
-              -> StateComponent AcidState PackageMaintainers -> (PackageName -> UserGroup) -> GroupResource
+              -> UploadStore.Backend
+              -> UserGroup -> GroupResource
+              -> UserGroup -> GroupResource
+              -> (PackageName -> UserGroup) -> GroupResource
+              -> Hook PackageId ()
               -> (UploadFeature,
                   UserGroup,
                   UserGroup,
@@ -195,9 +161,11 @@ uploadFeature ServerEnv{serverBlobStore = store}
                          , updateAddPackage
                          }
               UserFeature{..}
-              trusteesState    trusteesGroup    trusteesGroupResource
-              uploadersState   uploadersGroup   uploadersGroupResource
-              maintainersState maintainersGroup maintainersGroupResource
+              UploadStore.Backend{backendStore = uploadStore, backendState = uploadStateComponents}
+              trusteesGroup    trusteesGroupResource
+              uploadersGroup   uploadersGroupResource
+              maintainersGroup maintainersGroupResource
+              packageUploaded
    = ( UploadFeature {..}
      , trusteesGroupDescription, uploadersGroupDescription, maintainersGroupDescription)
    where
@@ -212,11 +180,7 @@ uploadFeature ServerEnv{serverBlobStore = store}
             , groupResource     uploadersGroupResource
             , groupUserResource uploadersGroupResource
             ]
-      , featureState = [
-            abstractAcidStateComponent trusteesState
-          , abstractAcidStateComponent uploadersState
-          , abstractAcidStateComponent maintainersState
-          ]
+      , featureState = uploadStateComponents
       }
 
     uploadResource = UploadResource
@@ -247,9 +211,9 @@ uploadFeature ServerEnv{serverBlobStore = store}
     trusteesGroupDescription :: UserGroup
     trusteesGroupDescription = UserGroup {
         groupDesc             = trusteeDescription,
-        queryUserGroup        = queryState  trusteesState   GetTrusteesList,
-        addUserToGroup        = updateState trusteesState . AddHackageTrustee,
-        removeUserFromGroup   = updateState trusteesState . RemoveHackageTrustee,
+        queryUserGroup        = UploadStore.getTrustees uploadStore,
+        addUserToGroup        = UploadStore.addTrustee uploadStore,
+        removeUserFromGroup   = UploadStore.removeTrustee uploadStore,
         groupsAllowedToAdd    = [adminGroup],
         groupsAllowedToDelete = [adminGroup]
     }
@@ -257,9 +221,9 @@ uploadFeature ServerEnv{serverBlobStore = store}
     uploadersGroupDescription :: UserGroup
     uploadersGroupDescription = UserGroup {
         groupDesc             = uploaderDescription,
-        queryUserGroup        = queryState  uploadersState   GetUploadersList,
-        addUserToGroup        = updateState uploadersState . AddHackageUploader,
-        removeUserFromGroup   = updateState uploadersState . RemoveHackageUploader,
+        queryUserGroup        = UploadStore.getUploaders uploadStore,
+        addUserToGroup        = UploadStore.addUploader uploadStore,
+        removeUserFromGroup   = UploadStore.removeUploader uploadStore,
         groupsAllowedToAdd    = [adminGroup, trusteesGroup],
         groupsAllowedToDelete = [adminGroup, trusteesGroup]
     }
@@ -269,9 +233,9 @@ uploadFeature ServerEnv{serverBlobStore = store}
       fix $ \thisgroup ->
       UserGroup {
         groupDesc             = maintainerDescription name,
-        queryUserGroup        = queryState  maintainersState $ GetPackageMaintainers name,
-        addUserToGroup        = updateState maintainersState . AddPackageMaintainer name,
-        removeUserFromGroup   = updateState maintainersState . RemovePackageMaintainer name,
+        queryUserGroup        = UploadStore.getPackageMaintainers uploadStore name,
+        addUserToGroup        = UploadStore.addPackageMaintainer uploadStore name,
+        removeUserFromGroup   = UploadStore.removePackageMaintainer uploadStore name,
         groupsAllowedToAdd    = [thisgroup, adminGroup],
         groupsAllowedToDelete = [thisgroup, adminGroup]
       }
@@ -302,7 +266,7 @@ uploadFeature ServerEnv{serverBlobStore = store}
         now <- liftIO getCurrentTime
         let (UploadResult pkg pkgStr _) = uresult
             pkgid      = packageId pkg
-            cabalfile  = CabalFileText pkgStr
+            cabalfile  = CabalFileText $ toStrict pkgStr
             uploadinfo = (now, uid)
         success <- updateAddPackage pkgid cabalfile uploadinfo (Just tarball)
         if success
@@ -314,6 +278,7 @@ uploadFeature ServerEnv{serverBlobStore = store}
                 liftIO $ addUserToGroup group uid
                 runHook_ groupChangedHook (groupDesc group, True,uid,uid,"initial upload")
 
+            runHook_ packageUploaded pkgid
             return uresult
           -- this is already checked in processUpload, and race conditions are highly unlikely but imaginable
           else errForbidden "Upload failed" [MText "Package already exists."]
@@ -417,7 +382,7 @@ uploadFeature ServerEnv{serverBlobStore = store}
             --FIXME: this should have been covered earlier
             uid <- guardAuthenticated
             now <- liftIO getCurrentTime
-            let processPackage :: ByteString -> IO (Either ErrorResponse (UploadResult, BlobStorage.BlobId))
+            let processPackage :: LazyByteString -> IO (Either ErrorResponse (UploadResult, BlobStorage.BlobId))
                 processPackage content' = do
                     -- as much as it would be nice to do requirePackageAuth in here,
                     -- processPackage is run in a handle bracket

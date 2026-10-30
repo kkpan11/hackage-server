@@ -7,42 +7,40 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
 module Distribution.Server.Features.UserNotify (
-    NotifyData(..),
-    NotifyPref(..),
-    NotifyRevisionRange(..),
-    NotifyTriggerBounds(..),
     UserNotifyFeature(..),
-    defaultNotifyPrefs,
     getUserNotificationsOnRelease,
     importNotifyPref,
     initUserNotifyFeature,
     notifyDataToCSV,
 
     -- * getNotificationEmails
-    Notification(..),
-    NotifyMaintainerUpdateType(..),
     getNotificationEmails,
+    notificationUserIds,
   ) where
 
+import Distribution.Server.Features.UserDetails.Types
+import qualified Distribution.Server.Features.UserNotify.Acid.Component as AcidComponent
+import qualified Distribution.Server.Features.UserNotify.Acid as Acid
+import qualified Distribution.Server.Features.UserNotify.Store as Store
+import Distribution.Server.Features.UserNotify.Acid (NotifyPref(..))
+import Distribution.Server.Features.UserNotify.Backup
+import Distribution.Server.Features.UserNotify.Types
 import Prelude hiding (lookup)
 import Distribution.Package
 import Distribution.Pretty
 import Distribution.Version
 
-import qualified Distribution.Server.Users.Users as Users
 import Distribution.Server.Users.Group
-import Distribution.Server.Users.Types (UserId, UserInfo (..))
+import Distribution.Server.Users.Types (UserId, UserInfo (..), UserName)
 import Distribution.Server.Users.UserIdSet as UserIdSet
 
 import Distribution.Server.Packages.Types
-import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupDump
-import Distribution.Server.Framework.BackupRestore
 import Distribution.Server.Framework.Templating
 
 import Distribution.Server.Features.AdminLog
+import Distribution.Server.Features.AdminLog.Types
 import Distribution.Server.Features.BuildReports
 import qualified Distribution.Server.Features.BuildReports.BuildReport as BuildReport
 import Distribution.Server.Features.Core
@@ -62,35 +60,26 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 
 import Control.Concurrent (threadDelay)
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, put)
-import Data.Aeson.TH (defaultOptions, deriveJSON)
+import Data.Aeson.TH (deriveJSON)
 import Data.Bifunctor (Bifunctor(second))
 import Data.Bimap (lookup, lookupR)
-import Data.Graph (Vertex)
 import Data.Hashable (Hashable(..))
-import Data.List (maximumBy, sortOn)
-import Data.Maybe (fromJust, fromMaybe, listToMaybe, mapMaybe, maybeToList)
-import Data.Ord (Down(..), comparing)
-import Data.SafeCopy (Migrate(migrate), MigrateFrom, base, deriveSafeCopy, extension)
-import Data.Time (UTCTime(..), addUTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
-import Data.Time.Format.Internal (buildTime)
-import Data.Typeable (Typeable)
+import Data.List (sortOn)
+import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
+import Data.Ord (Down(..))
+import Data.Time (addUTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Distribution.Text (display)
 import Network.Mail.Mime
 import Network.URI (uriAuthority, uriPath, uriRegName)
-import Text.CSV (CSV, Record)
 import Text.PrettyPrint hiding ((<>))
 import Text.XHtml hiding (base, text, (</>))
 
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString.Lazy.Char8 as BS
-import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Encoding as TL
-import qualified Data.Vector as Vec
 
 
 -- A feature to manage notifications to users when package metadata, etc is updated.
@@ -103,108 +92,12 @@ Some missing features:
 data UserNotifyFeature = UserNotifyFeature {
     userNotifyFeatureInterface :: HackageFeature,
 
-    queryGetUserNotifyPref  :: forall m. MonadIO m => UserId -> m (Maybe NotifyPref),
-    updateSetUserNotifyPref :: forall m. MonadIO m => UserId -> NotifyPref -> m ()
+    queryGetUserNotifyPref  :: forall m. MonadIO m => UserId -> m (Maybe Acid.NotifyPref),
+    updateSetUserNotifyPref :: forall m. MonadIO m => UserId -> Acid.NotifyPref -> m ()
 }
 
 instance IsHackageFeature UserNotifyFeature where
   getFeatureInterface = userNotifyFeatureInterface
-
--------------------------
--- Types of stored data
---
-data NotifyPref_v0 = NotifyPref_v0
-                  {
-                    v0notifyOptOut :: Bool,
-                    v0notifyRevisionRange :: NotifyRevisionRange,
-                    v0notifyUpload :: Bool,
-                    v0notifyMaintainerGroup :: Bool,
-                    v0notifyDocBuilderReport :: Bool,
-                    v0notifyPendingTags :: Bool
-                  }
-                  deriving (Eq, Read, Show, Typeable)
-data NotifyPref = NotifyPref
-                  {
-                    notifyOptOut :: Bool,
-                    notifyRevisionRange :: NotifyRevisionRange,
-                    notifyUpload :: Bool,
-                    notifyMaintainerGroup :: Bool,
-                    notifyDocBuilderReport :: Bool,
-                    notifyPendingTags :: Bool,
-                    notifyDependencyForMaintained :: Bool,
-                    notifyDependencyTriggerBounds :: NotifyTriggerBounds
-                  }
-                  deriving (Eq, Read, Show, Typeable)
-
-defaultNotifyPrefs :: NotifyPref
-defaultNotifyPrefs = NotifyPref {
-                       notifyOptOut = True, -- TODO when we're comfortable with this we can change to False.
-                       notifyRevisionRange = NotifyAllVersions,
-                       notifyUpload = True,
-                       notifyMaintainerGroup = True,
-                       notifyDocBuilderReport = True,
-                       notifyPendingTags = True,
-                       notifyDependencyForMaintained = True,
-                       notifyDependencyTriggerBounds = NewIncompatibility
-                     }
-
-data NotifyRevisionRange = NotifyAllVersions | NotifyNewestVersion | NoNotifyRevisions deriving (Bounded, Enum, Eq, Read, Show, Typeable)
-instance MemSize NotifyRevisionRange where
-  memSize _ = 1
-
-instance Pretty NotifyRevisionRange where
-  pretty NoNotifyRevisions = text "No"
-  pretty NotifyAllVersions = text "All Versions"
-  pretty NotifyNewestVersion = text "Newest Version"
-
-instance Hashable NotifyRevisionRange where
-  hash = fromEnum
-  hashWithSalt s x = s `hashWithSalt` hash x
-
-data NotifyTriggerBounds
-  = Always
-  | BoundsOutOfRange
-  | NewIncompatibility
-  deriving (Bounded, Enum, Eq, Read, Show, Typeable)
-
-instance MemSize NotifyTriggerBounds where
-  memSize _ = 1
-
-instance Hashable NotifyTriggerBounds where
-  hash = fromEnum
-  hashWithSalt s x = s `hashWithSalt` hash x
-
-instance MemSize NotifyPref_v0 where memSize _ = memSize ((True,True,True),(True,True, True))
-instance MemSize NotifyPref    where memSize NotifyPref{..} = memSize8 notifyOptOut notifyRevisionRange notifyUpload notifyMaintainerGroup
-                                                                       notifyDocBuilderReport notifyPendingTags notifyDependencyForMaintained
-                                                                       notifyDependencyTriggerBounds
-
-data NotifyData = NotifyData {unNotifyData :: (Map.Map UserId NotifyPref, UTCTime)} deriving (Eq, Show, Typeable)
-
-instance MemSize NotifyData where memSize (NotifyData x) = memSize x
-
-emptyNotifyData :: IO NotifyData
-emptyNotifyData = getCurrentTime >>= \x-> return (NotifyData (Map.empty, x))
-
-$(deriveSafeCopy 0 'base ''NotifyTriggerBounds)
-$(deriveSafeCopy 0 'base ''NotifyRevisionRange)
-$(deriveSafeCopy 0 'base ''NotifyPref_v0)
-
-instance Migrate NotifyPref where
-  type MigrateFrom NotifyPref = NotifyPref_v0
-  migrate (NotifyPref_v0 f0 f1 f2 f3 f4 f5) =
-    NotifyPref f0 f1 f2 f3 f4 f5
-      False -- Users that already have opted in to notifications
-            -- did so at at a time when it did not include
-            -- reverse dependency emails.
-            -- So let's assume they don't want these.
-            -- Note that this differs from defaultNotifyPrefs.
-      NewIncompatibility
-
-$(deriveSafeCopy 1 'extension ''NotifyPref)
-$(deriveSafeCopy 0 'base ''NotifyData)
-$(deriveJSON defaultOptions ''NotifyRevisionRange)
-$(deriveJSON defaultOptions ''NotifyTriggerBounds)
 
 ------------------------------
 -- UI
@@ -249,7 +142,7 @@ data NotifyPrefUI
     , ui_notifyDependencyForMaintained :: OK
     , ui_notifyDependencyTriggerBounds :: NotifyTriggerBounds
     }
-  deriving (Eq, Show, Typeable)
+  deriving (Eq, Show)
 
 $(deriveJSON (compatAesonOptionsDropPrefix "ui_") ''NotifyPrefUI)
 
@@ -262,8 +155,8 @@ instance Hashable NotifyPrefUI where
     `hashWithSalt` hash ui_notifyDocBuilderReport
     `hashWithSalt` hash ui_notifyPendingTags
 
-notifyPrefToUI :: NotifyPref -> NotifyPrefUI
-notifyPrefToUI NotifyPref{..} = NotifyPrefUI
+notifyPrefToUI :: Acid.NotifyPref -> NotifyPrefUI
+notifyPrefToUI Acid.NotifyPref{..} = NotifyPrefUI
   { ui_notifyEnabled          = OK (not notifyOptOut)
   , ui_notifyRevisionRange    = notifyRevisionRange
   , ui_notifyUpload           = OK notifyUpload
@@ -274,9 +167,9 @@ notifyPrefToUI NotifyPref{..} = NotifyPrefUI
   , ui_notifyDependencyTriggerBounds = notifyDependencyTriggerBounds
   }
 
-notifyPrefFromUI :: NotifyPrefUI -> NotifyPref
+notifyPrefFromUI :: NotifyPrefUI -> Acid.NotifyPref
 notifyPrefFromUI NotifyPrefUI{..}
-  = NotifyPref
+  = Acid.NotifyPref
   { notifyOptOut           = not (unOK ui_notifyEnabled)
   , notifyRevisionRange    = ui_notifyRevisionRange
   , notifyUpload           = unOK ui_notifyUpload
@@ -312,119 +205,9 @@ instance ToRadioButtons NotifyRevisionRange where
 instance ToRadioButtons OK where
   toRadioButtons = renderRadioButtons [OK True, OK False]
 
-------------------------------
--- State queries and updates
---
-
-getNotifyData :: Query NotifyData NotifyData
-getNotifyData = ask
-
-replaceNotifyData :: NotifyData -> Update NotifyData ()
-replaceNotifyData = put
-
-getNotifyTime :: Query NotifyData UTCTime
-getNotifyTime = fmap (snd . unNotifyData) ask
-
-setNotifyTime :: UTCTime -> Update NotifyData ()
-setNotifyTime t = do
-    NotifyData (m,_) <- get
-    put $! NotifyData (m,t)
-
-lookupNotifyPref :: UserId -> Query NotifyData (Maybe NotifyPref)
-lookupNotifyPref uid = do
-    NotifyData (m,_) <- ask
-    return $! Map.lookup uid m
-
-addNotifyPref :: UserId -> NotifyPref -> Update NotifyData ()
-addNotifyPref uid info = do
-    NotifyData (m,t) <- get
-    put $! NotifyData (Map.insert uid info m,t)
-
-makeAcidic ''NotifyData [
-    --queries
-    'getNotifyData,
-    'lookupNotifyPref,
-    'getNotifyTime,
-    --updates
-    'replaceNotifyData,
-    'addNotifyPref,
-    'setNotifyTime
-  ]
-
-
-----------------------------
--- Data backup and restore
---
-
-userNotifyBackup :: RestoreBackup NotifyData
-userNotifyBackup = go []
-  where
-   go :: [(UserId, NotifyPref)] -> RestoreBackup NotifyData
-   go st =
-     RestoreBackup {
-       restoreEntry = \entry -> case entry of
-         BackupByteString ["notifydata.csv"] bs -> do
-           csv <- importCSV "notifydata.csv" bs
-           prefs <- importNotifyPref csv
-           return (go (prefs ++ st))
-
-         _ -> return (go st)
-
-     , restoreFinalize =
-        return (NotifyData (Map.fromList st, fromJust (buildTime defaultTimeLocale []))) -- defaults to unixstart time
-     }
-
-importNotifyPref :: CSV -> Restore [(UserId, NotifyPref)]
-importNotifyPref = sequence . map fromRecord . drop 2
-  where
-    fromRecord :: Record -> Restore (UserId, NotifyPref)
-    fromRecord [uid,o,rr,ul,g,db,t,dep1,dep2] = do
-        puid <- parseText "user id" uid
-        po <- parseRead "notify opt out" o
-        prr <- parseRead "notify revsion" rr
-        pul <- parseRead "notify upload" ul
-        pg <- parseRead "notify group mod" g
-        pd <- parseRead "notify docbuilder" db
-        pt <- parseRead "notify pending tags" t
-        pdep1 <- parseRead "notify dependency for maintained" dep1
-        pdep2 <- parseRead "notify dependency trigger bounds" dep2
-        return (puid, NotifyPref po prr pul pg pd pt pdep1 pdep2)
-    fromRecord x = fail $ "Error processing notify record: " ++ show x
-
-notifyDataToCSV :: BackupType -> NotifyData -> CSV
-notifyDataToCSV _backuptype (NotifyData (tbl,_))
-    = ["0.1"]
-    : [ "uid","freq","revisionrange","upload","group","pending_tags","dep_for_maintained","dep_trigger_bounds"]
-    : flip map (Map.toList tbl) (\(uid,np) ->
-        [ display uid
-        , show (notifyOptOut np)
-        , show (notifyRevisionRange np)
-        , show (notifyUpload np)
-        , show (notifyMaintainerGroup np)
-        , show (notifyDocBuilderReport np)
-        , show (notifyPendingTags np)
-        , show (notifyDependencyForMaintained np)
-        , show (notifyDependencyTriggerBounds np)
-        ]
-      )
-
 ----------------------------
 -- State Component
 --
-
-notifyStateComponent :: FilePath -> IO (StateComponent AcidState NotifyData)
-notifyStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "UserNotify") =<< emptyNotifyData
-  return StateComponent {
-      stateDesc    = "State to keep track of revision notifications"
-    , stateHandle  = st
-    , getState     = query st GetNotifyData
-    , putState     = update st . ReplaceNotifyData
-    , backupState  = \backuptype tbl ->
-        [csvToBackup ["notifydata.csv"] (notifyDataToCSV backuptype tbl)]
-    , restoreState = userNotifyBackup
-    , resetState   = notifyStateComponent
-    }
 
 ----------------------------
 -- Core Feature
@@ -444,7 +227,7 @@ initUserNotifyFeature :: ServerEnv
 initUserNotifyFeature ServerEnv{ serverStateDir, serverTemplatesDir,
                                      serverTemplatesMode } = do
     -- Canonical state
-    notifyState <- notifyStateComponent serverStateDir
+    notifyBackend <- AcidComponent.acidStore serverStateDir
 
     -- Page templates
     templates <- loadTemplates serverTemplatesMode
@@ -454,12 +237,30 @@ initUserNotifyFeature ServerEnv{ serverStateDir, serverTemplatesDir,
     return $ \users core uploadfeature adminlog userdetails reports tags revers vouch -> do
       let feature = userNotifyFeature
                       users core uploadfeature adminlog userdetails reports tags
-                      revers vouch notifyState templates
+                      revers vouch notifyBackend templates
       return feature
 
 data InRange = InRange | OutOfRange
 
--- | Get the users to notify when a new package has been released.
+isNewestVersion :: [PkgInfo] -> PackageId -> Bool
+isNewestVersion versions pkgId =
+  pkgId `elem` map packageId versions
+    && all ((<= pkgVersion pkgId) . packageVersion) versions
+
+reverseDependencyNames :: ReverseIndex -> PackageName -> [PackageName]
+reverseDependencyNames (ReverseIndex revs nodemap _) pkgname =
+  case lookup pkgname nodemap :: Maybe NodeId of
+    Nothing -> []
+    Just node -> mapMaybe (`lookupR` nodemap) (Set.toList (suc revs node))
+
+latestDependencies :: Map PackageId [Dependency] -> PackageName -> Maybe (PackageId, [Dependency])
+latestDependencies dependencies pkgname =
+  Map.lookupMax
+    . Map.takeWhileAntitone ((== pkgname) . pkgName)
+    . Map.dropWhileAntitone ((< pkgname) . pkgName)
+    $ dependencies
+
+-- | Acid.Get the users to notify when a new package has been released.
 --   The new package (PackageId) must already be in the indexes.
 --   The keys in the returned map are the user to notify, and the values are
 --   the packages the user maintains that depend on the new package (i.e. the
@@ -467,52 +268,42 @@ data InRange = InRange | OutOfRange
 getUserNotificationsOnRelease
   :: forall m. Monad m
   => (PackageName -> m UserIdSet)
-  -> PackageIndex.PackageIndex PkgInfo
+  -> (PackageName -> [PkgInfo])
   -> ReverseIndex
-  -> (UserId -> m (Maybe NotifyPref))
+  -> (UserId -> m (Maybe Acid.NotifyPref))
   -> PackageId
   -> m (Map.Map UserId [PackageId])
-getUserNotificationsOnRelease _ index _ _ pkgId
-  | let versionsForNewRelease = packageVersion <$> PackageIndex.lookupPackageName index (pkgName pkgId)
-  , pkgVersion pkgId /= maximum versionsForNewRelease
+getUserNotificationsOnRelease _ packagesNamed _ _ pkgId
+  | not (isNewestVersion (packagesNamed (pkgName pkgId)) pkgId)
   -- If e.g. a minor bugfix release is made for an old release series, never notify maintainers.
   -- Only start checking if the new version is the highest.
   = pure mempty
-getUserNotificationsOnRelease userSetIdForPackage index (ReverseIndex revs nodemap dependencies) queryGetUserNotifyPref pkgId =
-  case lookup (pkgName pkgId) nodemap :: Maybe NodeId of
-    Nothing -> pure mempty
-    Just foundPackage -> do
-      let
-        vertices :: Set.Set Vertex
-        vertices = suc revs foundPackage
-        revDepNames :: [PackageName]
-        revDepNames = mapMaybe (`lookupR` nodemap) (Set.toList vertices)
-      toNotify <- traverse maintainersToNotify revDepNames
-      pure $
-        Map.fromListWith (++)
-          [ (maintainerId, [packageId latestRevDep])
-          | (ids, latestRevDep) <- toNotify
-          , maintainerId <- ids
-          ]
+getUserNotificationsOnRelease userSetIdForPackage packagesNamed revIdx@(ReverseIndex _ _ dependencies) queryGetUserNotifyPref pkgId = do
+  toNotify <- traverse maintainersToNotify
+    . mapMaybe (latestDependencies dependencies)
+    $ reverseDependencyNames revIdx (pkgName pkgId)
+  pure $
+    Map.fromListWith (++)
+      [ (maintainerId, [latestRevDep])
+      | (ids, latestRevDep) <- toNotify
+      , maintainerId <- ids
+      ]
   where
-    -- | Goes through the maintainers of the reverse dep identified by the PackageName passed in,
-    --   finds the ones to notify.
-    --   Returns the userIds and when they wanted notifications (NotifyTriggerBounds).
-    --   The PkgInfo is the latest version of the reverse dependency passed in as PackageName.
-    maintainersToNotify :: PackageName -> m ([UserId], PkgInfo)
-    maintainersToNotify revDepName = do
-      userIdSet <- userSetIdForPackage revDepName
+    -- Finds the maintainers of a reverse dependency to notify, judged by the
+    -- dependencies of its latest version.
+    maintainersToNotify :: (PackageId, [Dependency]) -> m ([UserId], PackageId)
+    maintainersToNotify (latestRevDep, depListWithCollisions) = do
+      userIdSet <- userSetIdForPackage (pkgName latestRevDep)
       let ids = UserIdSet.toList userIdSet
       mPrefs <- traverse queryGetUserNotifyPref ids
       let
         idsAndTriggers :: [UserId]
         idsAndTriggers = do
-          (userId, Just NotifyPref{..}) <- zip ids mPrefs
+          (userId, Just Acid.NotifyPref{..}) <- zip ids mPrefs
           guard $ not notifyOptOut
           guard notifyDependencyForMaintained
 
-          Just depListWithCollisions <- [mDepList]
-          -- Remove collisions on the same PackageName, amassed e.g. across
+          -- Acid.Remove collisions on the same PackageName, amassed e.g. across
           -- multiple conditional branches. The branches could be from either
           -- side of an 'if' block conditioned on a flag. If either of them
           -- permits the newly released version, avoid sending the notification.
@@ -520,7 +311,7 @@ getUserNotificationsOnRelease userSetIdForPackage index (ReverseIndex revs nodem
 
           case notifyDependencyTriggerBounds of
             NewIncompatibility -> do
-              let allNewUploadPkgInfos = PackageIndex.lookupPackageName index (pkgName pkgId)
+              let allNewUploadPkgInfos = packagesNamed (pkgName pkgId)
                   sortedByVersionDesc = sortOn (Down . packageVersion) allNewUploadPkgInfos
                   mSecondHighest =
                     case sortedByVersionDesc of
@@ -541,9 +332,6 @@ getUserNotificationsOnRelease userSetIdForPackage index (ReverseIndex revs nodem
           [userId]
       pure (idsAndTriggers, latestRevDep)
       where
-        latestRevDep = maximumBy (comparing packageVersion) (PackageIndex.lookupPackageName index revDepName)
-        mDepList :: Maybe [Dependency]
-        mDepList = Map.lookup (packageId latestRevDep) dependencies
         isDependencyMatchingAnd :: InRange -> Version -> Dependency -> Bool
         isDependencyMatchingAnd InRange depVersion (Dependency depName depRange _)
           | depName /= pkgName pkgId = False
@@ -585,7 +373,7 @@ userNotifyFeature :: UserFeature
                   -> TagsFeature
                   -> ReverseFeature
                   -> VouchFeature
-                  -> StateComponent AcidState NotifyData
+                  -> Store.Backend
                   -> Templates
                   -> UserNotifyFeature
 userNotifyFeature UserFeature{..}
@@ -597,7 +385,8 @@ userNotifyFeature UserFeature{..}
                   TagsFeature{..}
                   ReverseFeature{queryReverseIndex}
                   VouchFeature{drainQueuedNotifications}
-                  notifyState templates
+                  Store.Backend{backendStore = notifyStore, backendState}
+                  templates
   = UserNotifyFeature {..}
 
   where
@@ -605,7 +394,7 @@ userNotifyFeature UserFeature{..}
     userNotifyFeatureInterface = (emptyHackageFeature "user-notify") {
         featureDesc      = "Notifications to users on metadata updates."
       , featureResources = [userNotifyResource] -- TODO we can add json features here for updating prefs
-      , featureState     = [abstractAcidStateComponent notifyState]
+      , featureState     = backendState
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupNotifyCronJob
@@ -628,24 +417,24 @@ userNotifyFeature UserFeature{..}
     -- Queries and updates
     --
 
-    queryGetUserNotifyPref  ::  MonadIO m => UserId -> m (Maybe NotifyPref)
-    queryGetUserNotifyPref uid = queryState notifyState (LookupNotifyPref uid)
+    queryGetUserNotifyPref  ::  MonadIO m => UserId -> m (Maybe Acid.NotifyPref)
+    queryGetUserNotifyPref = Store.lookupNotifyPref notifyStore
 
-    updateSetUserNotifyPref ::  MonadIO m => UserId -> NotifyPref -> m ()
-    updateSetUserNotifyPref uid np = updateState notifyState (AddNotifyPref uid np)
+    updateSetUserNotifyPref ::  MonadIO m => UserId -> Acid.NotifyPref -> m ()
+    updateSetUserNotifyPref = Store.addNotifyPref notifyStore
 
     -- Request handlers
     --
     handlerGetUserNotify dpath = do
       uid <- lookupUserName =<< userNameInPath dpath
       guardAuthorised_ [IsUserId uid, InGroup adminGroup]
-      nprefui <- notifyPrefToUI . fromMaybe defaultNotifyPrefs <$> queryGetUserNotifyPref uid
+      nprefui <- notifyPrefToUI . fromMaybe Acid.defaultNotifyPrefs <$> queryGetUserNotifyPref uid
       return $ toResponse (Aeson.toJSON nprefui)
 
     handlerGetUserNotifyHtml dpath = do
       (uid, uinfo) <- lookupUserNameFull =<< userNameInPath dpath
       guardAuthorised_ [IsUserId uid, InGroup adminGroup]
-      NotifyPrefUI{..} <- notifyPrefToUI . fromMaybe defaultNotifyPrefs <$> queryGetUserNotifyPref uid
+      NotifyPrefUI{..} <- notifyPrefToUI . fromMaybe Acid.defaultNotifyPrefs <$> queryGetUserNotifyPref uid
       showConfirmationOfSave <- not . Prelude.null <$> queryString (lookBSs "showConfirmationOfSave")
       template <- getTemplate templates "user-notify-form.html"
       cacheControlWithoutETag [NoCache]
@@ -690,15 +479,14 @@ userNotifyFeature UserFeature{..}
       }
 
     notifyCronAction = do
-        (notifyPrefs, lastNotifyTime) <- unNotifyData <$> queryState notifyState GetNotifyData
+        (notifyPrefs, lastNotifyTime) <- Store.getNotificationData notifyStore
         now <- getCurrentTime
         let trimLastTime = if diffUTCTime now lastNotifyTime > (60*60*6) -- cap at 6hr
                              then addUTCTime (negate $ (60*60*6)) now
                              else lastNotifyTime -- for testing you can increase this
-        users <- queryGetUserDb
-
-        revisionsAndUploads <- collectRevisionsAndUploads trimLastTime now
-        revisionUploadNotifications <- concatMapM (genRevUploadList notifyPrefs trimLastTime now) revisionsAndUploads
+        revisionsAndUploads <- queryLatestUploadsBetween trimLastTime now
+        uploadedPackages <- queryLookupPackageNames (map (packageName . pkgInfoId) revisionsAndUploads)
+        revisionUploadNotifications <- concatMapM (genRevUploadList notifyPrefs uploadedPackages trimLastTime now) revisionsAndUploads
 
         groupActions <- collectAdminActions trimLastTime now
         groupActionNotifications <- concatMapM (genGroupUploadList notifyPrefs) groupActions
@@ -709,67 +497,63 @@ userNotifyFeature UserFeature{..}
         tagProposals <- collectTagProposals
         tagProposalNotifications <- concatMapM (genTagProposalList notifyPrefs) tagProposals
 
-        idx <- queryGetPackageIndex
         revIdx <- liftIO queryReverseIndex
-        dependencyUpdateNotifications <- concatMapM (genDependencyUpdateList notifyPrefs idx revIdx . pkgInfoToPkgId) revisionsAndUploads
+        let packagesNamed pkgname = Map.findWithDefault [] pkgname uploadedPackages
+        dependencyUpdateNotifications <- concatMapM (genDependencyUpdateList notifyPrefs packagesNamed revIdx . pkgInfoToPkgId) revisionsAndUploads
 
         vouchNotifications <- fmap (, NotifyVouchingCompleted) <$> drainQueuedNotifications
 
+        let notifications =
+              concat
+                [ revisionUploadNotifications
+                , groupActionNotifications
+                , docReportNotifications
+                , tagProposalNotifications
+                , dependencyUpdateNotifications
+                , vouchNotifications
+                ]
+        userIdToName <- queryUserNamesFor (concatMap notificationUserIds notifications)
         emails <-
-          getNotificationEmails userFeatureServerEnv userDetailsFeature users templates $
-            concat
-              [ revisionUploadNotifications
-              , groupActionNotifications
-              , docReportNotifications
-              , tagProposalNotifications
-              , dependencyUpdateNotifications
-              , vouchNotifications
-              ]
+          getNotificationEmails userFeatureServerEnv userDetailsFeature userIdToName templates notifications
         mapM_ sendNotifyEmailAndDelay emails
 
-        updateState notifyState (SetNotifyTime now)
-
-    collectRevisionsAndUploads earlier now = do
-        pkgIndex <- queryGetPackageIndex
-        let isRecent pkgInfo =
-               let rt = pkgLatestUploadTime pkgInfo
-               in rt > earlier && rt <= now
-        return $ filter isRecent $ (PackageIndex.allPackages pkgIndex)
+        Store.setNotifyTime notifyStore now
 
     collectAdminActions earlier now = do
-        aLog <- adminLog <$> queryGetAdminLog
+        aLog <- queryGetAdminLog
         let isRecent (t,_,_,_) = t > earlier && t <= now
         return $ filter isRecent $ aLog
 
     collectDocReport earlier now = do
-        pkgs <- PackageIndex.allPackages <$> queryGetPackageIndex
-        pkgRpts <- forM pkgs $ \pkg -> do
-          rpts <- queryPackageReports (packageId pkg)
-          pure $ (pkg,) $ do
-            -- List monad, filter out recent docbuilds
-            (_, rpt@BuildReport.BuildReport{..}) <- rpts
-            t <- maybeToList time
-            guard $ docsOutcome /= BuildReport.NotTried && t > earlier && t <= now
-            pure rpt
-        let isBuildOk BuildReport.BuildReport{..} = docsOutcome == BuildReport.Ok
-        pure $ map (second (all isBuildOk)) $ filter (not . Prelude.null . snd) pkgRpts
+        rpts <- queryReportsBetween earlier now
+        let docRpts = Map.fromListWith (flip (++))
+              [ (pkgid, [rpt])
+              | (pkgid, rpt) <- rpts
+              , BuildReport.docsOutcome rpt /= BuildReport.NotTried
+              ]
+            isBuildOk rpt = BuildReport.docsOutcome rpt == BuildReport.Ok
+        indexedPackages <- queryLookupPackageNames (map packageName (Map.keys docRpts))
+        let isInMainIndex pkgid =
+              any ((== pkgid) . pkgInfoId) (Map.findWithDefault [] (packageName pkgid) indexedPackages)
+        pure $ filter (isInMainIndex . fst) $
+          map (second (all isBuildOk)) (Map.toList docRpts)
 
     collectTagProposals = do
         logs <- readMemState tagProposalLog
         writeMemState tagProposalLog Map.empty
         pure $ Map.toList logs
 
-    genRevUploadList notifyPrefs earlier now pkg = do
-         pkgIndex <- queryGetPackageIndex
-         let actor = pkgLatestUploadUser pkg
+    genRevUploadList notifyPrefs uploadedPackages earlier now pkg = do
+         let pkgName = packageName . pkgInfoId $ pkg
+             allVersions = Map.findWithDefault [] pkgName uploadedPackages
+             actor = pkgLatestUploadUser pkg
              isRevision = pkgNumRevisions pkg > 1
-             pkgName = packageName . pkgInfoId $ pkg
-             mbLatest = listToMaybe . take 1 . reverse $ PackageIndex.lookupPackageName pkgIndex pkgName
+             mbLatest = listToMaybe (reverse allVersions)
              isLatestVersion = maybe False (\x -> pkgInfoId pkg == pkgInfoId x) mbLatest
-         maintainers <- queryUserGroup $ maintainersGroup (packageName . pkgInfoId $ pkg)
+         maintainers <- queryUserGroup $ maintainersGroup pkgName
          pure . flip mapMaybe (toList maintainers) $ \uid ->
           fmap (uid,) $ do
-            let NotifyPref{..} = fromMaybe defaultNotifyPrefs (Map.lookup uid notifyPrefs)
+            let Acid.NotifyPref{..} = fromMaybe Acid.defaultNotifyPrefs (Map.lookup uid notifyPrefs)
             guard $ uid /= actor
             guard $ not notifyOptOut
             if isRevision
@@ -782,9 +566,7 @@ userNotifyFeature UserFeature{..}
                     { notifyPackageId = pkgInfoId pkg
                     , notifyRevisions =
                         filter (\(t, _) -> earlier < t && t <= now)
-                          . map snd
-                          . Vec.toList
-                          $ pkgMetadataRevisions pkg
+                          $ pkgAllRevisionsUploadInfos pkg
                     }
               else do
                 guard notifyUpload
@@ -797,7 +579,7 @@ userNotifyFeature UserFeature{..}
       let notifyAllMaintainers actor pkg notif = do
             maintainers <- queryUserGroup $ maintainersGroup (mkPackageName $ BS.unpack pkg)
             pure . flip mapMaybe (toList maintainers) $ \uid -> do
-              let NotifyPref{..} = fromMaybe defaultNotifyPrefs (Map.lookup uid notifyPrefs)
+              let Acid.NotifyPref{..} = fromMaybe Acid.defaultNotifyPrefs (Map.lookup uid notifyPrefs)
               guard $ uid /= actor
               guard $ not notifyOptOut
               Just (uid, notif)
@@ -824,16 +606,16 @@ userNotifyFeature UserFeature{..}
               }
         _ -> pure []
 
-    genDocReportList notifyPrefs (pkg, success) = do
-      maintainers <- queryUserGroup $ maintainersGroup (packageName $ pkgInfoId pkg)
+    genDocReportList notifyPrefs (pkgid, success) = do
+      maintainers <- queryUserGroup $ maintainersGroup (packageName pkgid)
       pure . flip mapMaybe (toList maintainers) $ \uid ->
         fmap (uid,) $ do
-          let NotifyPref{..} = fromMaybe defaultNotifyPrefs (Map.lookup uid notifyPrefs)
+          let Acid.NotifyPref{..} = fromMaybe Acid.defaultNotifyPrefs (Map.lookup uid notifyPrefs)
           guard $ not notifyOptOut
           guard notifyDocBuilderReport
           Just
             NotifyDocsBuild
-              { notifyPackageId = pkgInfoId pkg
+              { notifyPackageId = pkgid
               , notifyBuildSuccess = success
               }
 
@@ -841,7 +623,7 @@ userNotifyFeature UserFeature{..}
       maintainers <- queryUserGroup $ maintainersGroup pkg
       pure . flip mapMaybe (toList maintainers) $ \uid ->
         fmap (uid,) $ do
-          let NotifyPref{..} = fromMaybe defaultNotifyPrefs (Map.lookup uid notifyPrefs)
+          let Acid.NotifyPref{..} = fromMaybe Acid.defaultNotifyPrefs (Map.lookup uid notifyPrefs)
           guard $ not notifyOptOut
           guard notifyPendingTags
           Just
@@ -851,17 +633,17 @@ userNotifyFeature UserFeature{..}
               , notifyDeletedTags = deletedTags
               }
 
-    genDependencyUpdateList notifyPrefs idx revIdx pkg = do
+    genDependencyUpdateList notifyPrefs packagesNamed revIdx pkg = do
       let toNotif uid watchedPkgs =
             NotifyDependencyUpdate
               { notifyPackageId = pkg
               , notifyWatchedPackages = watchedPkgs
               , notifyTriggerBounds =
                   notifyDependencyTriggerBounds $
-                    fromMaybe defaultNotifyPrefs (Map.lookup uid notifyPrefs)
+                    fromMaybe Acid.defaultNotifyPrefs (Map.lookup uid notifyPrefs)
               }
       Map.toList . Map.mapWithKey toNotif
-        <$> getUserNotificationsOnRelease (queryUserGroup . maintainersGroup) idx revIdx queryGetUserNotifyPref pkg
+        <$> getUserNotificationsOnRelease (queryUserGroup . maintainersGroup) packagesNamed revIdx queryGetUserNotifyPref pkg
 
     sendNotifyEmailAndDelay :: Mail -> IO ()
     sendNotifyEmailAndDelay email = do
@@ -872,43 +654,18 @@ userNotifyFeature UserFeature{..}
       -- send out too many emails
       threadDelay 250000
 
-data Notification
-  = NotifyNewVersion
-      { notifyPackageInfo :: PkgInfo
-      }
-  | NotifyNewRevision
-      { notifyPackageId :: PackageId
-      , notifyRevisions :: [UploadInfo]
-      }
-  | NotifyMaintainerUpdate
-      { notifyMaintainerUpdateType :: NotifyMaintainerUpdateType
-      , notifyUserActor :: UserId
-      , notifyUserSubject :: UserId
-      , notifyPackageName :: PackageName
-      , notifyReason :: Text
-      , notifyUpdatedAt :: UTCTime
-      }
-  | NotifyDocsBuild
-      { notifyPackageId :: PackageId
-      , notifyBuildSuccess :: Bool
-      }
-  | NotifyUpdateTags
-      { notifyPackageName :: PackageName
-      , notifyAddedTags :: Set Tag
-      , notifyDeletedTags :: Set Tag
-      }
-  | NotifyDependencyUpdate
-      { notifyPackageId :: PackageId
-        -- ^ Dependency that was updated
-      , notifyWatchedPackages :: [PackageId]
-        -- ^ Packages maintained by user that depend on updated dep
-      , notifyTriggerBounds :: NotifyTriggerBounds
-      }
-  | NotifyVouchingCompleted
-  deriving (Show)
-
-data NotifyMaintainerUpdateType = MaintainerAdded | MaintainerRemoved
-  deriving (Show)
+-- | The users whose names the email for a notification shows, including its
+-- recipient.
+notificationUserIds :: (UserId, Notification) -> [UserId]
+notificationUserIds (recipient, notif) =
+  recipient : case notif of
+    NotifyNewVersion{notifyPackageInfo} -> [pkgLatestUploadUser notifyPackageInfo]
+    NotifyNewRevision{notifyRevisions} -> map snd notifyRevisions
+    NotifyMaintainerUpdate{notifyUserActor, notifyUserSubject} -> [notifyUserActor, notifyUserSubject]
+    NotifyDocsBuild{} -> []
+    NotifyUpdateTags{} -> []
+    NotifyDependencyUpdate{} -> []
+    NotifyVouchingCompleted -> []
 
 -- | Notifications in the same group are batched in the same email.
 --
@@ -919,18 +676,18 @@ data NotificationGroup
   | DependencyNotification PackageId
   deriving (Eq, Ord)
 
--- | Get all the emails to send for the given notifications.
+-- | Acid.Get all the emails to send for the given notifications.
 getNotificationEmails
   :: ServerEnv
   -> UserDetailsFeature
-  -> Users.Users
+  -> (UserId -> UserName)
   -> Templates
   -> [(UserId, Notification)]
   -> IO [Mail]
 getNotificationEmails
   ServerEnv{serverBaseURI}
   UserDetailsFeature{queryUserDetails}
-  allUsers
+  userIdToName
   templates
   notifications = do
     let userIds = Set.fromList $ map fst notifications
@@ -986,7 +743,7 @@ getNotificationEmails
               { uriPath =
                   concatMap ("/" <>)
                     [ "user"
-                    , display $ Users.userIdToName allUsers uid
+                    , display $ userIdToName uid
                     , "notify"
                     ]
               }
@@ -1111,7 +868,7 @@ getNotificationEmails
           { uriPath = "/package/" <> display (packageName pkg) <> "-" <> display (packageVersion pkg)
           }
 
-    renderUser = emailContentDisplay . Users.userIdToName allUsers
+    renderUser = emailContentDisplay . userIdToName
 
     renderTime = emailContentStr . formatTime defaultTimeLocale "%c"
 

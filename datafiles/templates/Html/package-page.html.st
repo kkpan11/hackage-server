@@ -5,8 +5,7 @@
   <link href="$doc.baseUrl$/quick-jump.css" rel="stylesheet" type="text/css" title="QuickJump" />
   $endif$
   $hackageCssTheme()$
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-solarizedlight.min.css" media="(prefers-color-scheme: light)" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css" media="(prefers-color-scheme: dark)" />
+  $syntaxHighlighting$
   <title>
     $package.name$$if(package.optional.hasSynopsis)$: $package.optional.synopsis$$endif$
   </title>
@@ -173,6 +172,11 @@
               <td class="word-wrap">$package.maintainer$</td>
             </tr>
 
+            <tr>
+              <th>Uploaded</th>
+              <td>$hackage.uploadTime$</td>
+            </tr>
+
             $if(hackage.hasUpdateTime)$
             <tr>
               <th>Revised</th>
@@ -199,7 +203,11 @@
             <tr>
               <th>Home page</th>
               <td class="word-wrap">
-                <a href=$package.optional.homepage$>$package.optional.homepage$</a>
+                $if(package.optional.homepageIsSafeURI)$
+                <a href="$package.optional.homepage$">$package.optional.homepage$</a>
+                $else$
+                $package.optional.homepage$
+                $endif$
               </td>
             </tr>
             $endif$
@@ -208,7 +216,11 @@
             <tr>
               <th>Bug&nbsp;tracker</th>
               <td class="word-wrap">
+                $if(package.optional.bugTrackerIsSafeURI)$
                 <a href="$package.optional.bugTracker$">$package.optional.bugTracker$</a>
+                $else$
+                $package.optional.bugTracker$
+                $endif$
               </td>
             </tr>
             $endif$
@@ -219,12 +231,6 @@
               <td class="word-wrap">$package.optional.sourceRepository$</td>
             </tr>
             $endif$
-
-            <tr>
-              <th>Uploaded</th>
-              <td>$hackage.uploadTime$</td>
-            </tr>
-
 
             $if(hackage.hasDistributions)$
             <tr>
@@ -295,8 +301,6 @@
       [<a href="#description">back to package description</a>]
       $package.optional.readme$
     </div>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@v1.29.0/components/prism-core.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@v1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
     $endif$
   </div> <!-- /content -->
 

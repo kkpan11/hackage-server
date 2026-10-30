@@ -18,18 +18,16 @@ import Distribution.Server.Packages.Render
 import Distribution.Server.Features.Users
 import Distribution.Server.Util.ServeTarball
 import Distribution.Server.Util.Markdown (renderMarkdown, supposedToBeMarkdown)
-import Distribution.Server.Pages.Template (hackagePage)
+import Distribution.Server.Util.Parse (unpackUTF8)
+import Distribution.Server.Pages.Template (hackagePageWithHead, syntaxHighlightingHead)
 
 import Distribution.Text
 import Distribution.Package
 import Distribution.PackageDescription
 
-import qualified Data.Text                as T
-import qualified Data.Text.Encoding       as T
-import qualified Data.Text.Encoding.Error as T
-import qualified Data.ByteString.Lazy as BS (ByteString, toStrict)
 import qualified Text.XHtml.Strict as XHtml
 import qualified Distribution.Utils.ShortText as ST
+import qualified Data.Map as Map
 import           Text.XHtml.Strict ((<<), (!))
 
 
@@ -74,7 +72,7 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
                                     }
                                   }
                        TarIndexCacheFeature{packageTarball, findToplevelFile}
-                       UserFeature{queryGetUserDb}
+                       UserFeature{queryLookupUserIds, userFeatureServerEnv}
   = PackageContentsFeature{..}
   where
     packageFeatureInterface = (emptyHackageFeature "package-contents") {
@@ -106,12 +104,12 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
 
     packageRender :: PkgInfo -> IO PackageRender
     packageRender pkg = do
-        users <- queryGetUserDb
+        users <- queryLookupUserIds (packageRenderUserIds pkg)
         changeLog <- findToplevelFile pkg isChangeLogFile
                  >>= either (\_ -> return Nothing) (return . Just)
         readme    <- findToplevelFile pkg isReadmeFile
                  >>= either (\_ -> return Nothing) (return . Just)
-        let render = doPackageRender users pkg
+        let render = doPackageRender (`Map.lookup` users) pkg
         return $ render { rendChangeLog = changeLog, rendReadme = readme }
 
 {-------------------------------------------------------------------------------
@@ -154,13 +152,14 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
           return $ toResponse $ Resource.XHtml $
             let title  = "Changelog for " ++ pkgName
                 title2 = "Changelog for " XHtml.+++ (XHtml.anchor ! [XHtml.href url] << pkgName)
-            in hackagePage title
+                headExtra = if supposedToBeMarkdown filename then syntaxHighlightingHead else []
+            in hackagePageWithHead headExtra title
                  [ XHtml.h2 << title2
                  , XHtml.thediv ! [XHtml.theclass "embedded-author-content"]
                                << if supposedToBeMarkdown filename
                                     then renderMarkdown filename contents
                                     else XHtml.thediv ! [XHtml.theclass "preformatted"]
-                                                     << unpackUtf8 contents
+                                                     << unpackUTF8 contents
                  ]
 
     serveReadmeText :: DynamicPath -> ServerPartE Response
@@ -187,14 +186,16 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
                   =<< liftIO (loadTarEntry tarfile offset)
           cacheControl [Public, maxAgeDays 30] etag
           return $ toResponse $ Resource.XHtml $
-            let title = "Readme for " ++ display (packageId pkg) in
-            hackagePage title
+            let title = "Readme for " ++ display (packageId pkg)
+                headExtra = if supposedToBeMarkdown filename then syntaxHighlightingHead else []
+            in
+            hackagePageWithHead headExtra title
               [ XHtml.h2 << title
               , XHtml.thediv ! [XHtml.theclass "embedded-author-content"]
                             << if supposedToBeMarkdown filename
                                  then renderMarkdown filename contents
                                  else XHtml.thediv ! [XHtml.theclass "preformatted"]
-                                                  << unpackUtf8 contents
+                                                  << unpackUTF8 contents
               ]
 
     -- return: not-found error or tarball
@@ -205,15 +206,12 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
       case mTarball of
         Left err ->
           errNotFound "Could not serve package contents" [MText err]
-        Right (fp, etag, index) ->
-          tarServeResponse <$> serveTarball (display (packageId pkg) ++ " source tarball")
-                       [] (display (packageId pkg)) fp index
-                       [Public, maxAgeDays 30] etag Nothing
-
-unpackUtf8 :: BS.ByteString -> String
-unpackUtf8 = T.unpack
-           . T.decodeUtf8With T.lenientDecode
-           . BS.toStrict
+        Right (fp, etag, index) -> do
+          tarServe <-
+            serveTarball (display (packageId pkg) ++ " source tarball")
+                         [] (display (packageId pkg)) fp index
+                         [Public, maxAgeDays 30] etag Nothing
+          requireUserContent userFeatureServerEnv (tarServeResponse tarServe)
 
 -- TODO: this helper is defined in at least two other places; consolidate
 -- | URL describing a package.
